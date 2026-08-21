@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V8</title>
+<title>EMT Madrid · V8.1</title>
 
 <style>
 :root {
@@ -1870,3 +1870,45 @@ $("stopInput").focus();
 </script>
 </body>
 </html>
+
+<style>
+/* ===== V8.1 · AJUSTE COMPACTO DE ESPACIADO ===== */
+#tab-search .search-intro { margin-bottom: 10px; }
+#tab-search > .search-tools { gap: 10px; }
+#tab-search .directory,
+#tab-search .controls { min-height: 0; }
+#tab-search .directory { padding: 14px; }
+#tab-search .controls { padding: 14px; }
+#tab-search .directory-results { max-height: 135px; }
+#tab-search .favorites-panel { margin-top: 10px; padding: 14px; }
+#tab-search .favorites-header { margin-bottom: 10px; }
+#tab-search .stop { margin-top: 10px; }
+
+#tab-nearby .nearby-hero {
+    padding: 16px;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+#tab-nearby .nearby-hero-icon {
+    width: 50px;
+    height: 50px;
+    border-radius: 15px;
+}
+#tab-nearby .nearby-panel { padding: 14px; }
+#tab-nearby .nearby-panel-header { margin-bottom: 10px; gap: 10px; }
+#tab-nearby .nearby-status-v8 { margin-bottom: 9px; padding: 9px 11px; }
+#tab-nearby .nearby-cards { gap: 9px; }
+
+@media (max-width: 760px) {
+    #tab-search > .search-tools { gap: 8px; }
+    #tab-search .directory,
+    #tab-search .controls,
+    #tab-search .favorites-panel { padding: 12px; }
+    #tab-search .favorites-panel { margin-top: 8px; }
+
+    #tab-nearby .nearby-hero { padding: 14px; gap: 10px; }
+    #tab-nearby .nearby-panel { padding: 12px; }
+    #tab-nearby .nearby-panel-header { align-items: flex-start; }
+    #tab-nearby .nearby-locate { margin-top: 0; }
+}
+</style>
