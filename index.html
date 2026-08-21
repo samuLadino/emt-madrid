@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V6</title>
+<title>EMT Madrid · V8</title>
 
 <style>
 :root {
@@ -448,7 +448,7 @@ pre {
 /* ===== NAVEGACIÓN DE LA APP ===== */
 .app-tabs {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(3, 1fr);
     gap: 5px;
     padding: 5px;
     margin-bottom: 20px;
@@ -689,6 +689,8 @@ pre {
     #tab-search .directory, #tab-search .controls { min-height: auto; }
 }
 
+\n/* ===== CERCA DE MÍ V8 ===== */\n.nearby-hero {\n    padding: 24px;\n    display: grid;\n    grid-template-columns: auto 1fr auto;\n    gap: 18px;\n    align-items: center;\n    margin-bottom: 18px;\n}\n.nearby-hero-icon {\n    width: 58px; height: 58px; display: grid; place-items: center;\n    border-radius: 18px; background: var(--accent-soft); font-size: 27px;\n}\n.nearby-kicker { color: var(--accent); font-size: 11px; font-weight: 900; letter-spacing: .12em; }\n.nearby-locate { min-width: 150px; }\n.nearby-panel { padding: 20px; }\n.nearby-panel-header { display:flex; justify-content:space-between; align-items:center; gap:14px; margin-bottom:14px; }\n.nearby-status-v8 { margin-bottom:12px; padding:11px 13px; border:1px solid var(--border); border-radius:12px; color:var(--muted); font-size:12px; background:var(--panel-solid); }\n.nearby-cards { display:grid; gap:12px; }\n.nearby-card { border:1px solid var(--border); border-radius:18px; background:var(--panel-solid); overflow:hidden; cursor:pointer; }
+.nearby-card:hover { border-color:var(--accent); }\n.nearby-card-head { display:grid; grid-template-columns:62px 1fr auto; gap:13px; align-items:center; padding:15px; }\n.nearby-stop-number { width:58px; height:52px; display:grid; place-items:center; border-radius:14px; background:var(--accent-soft); color:var(--accent); font-weight:950; font-size:15px; }\n.nearby-stop-name { font-weight:900; font-size:16px; }\n.nearby-stop-address { color:var(--muted); font-size:11px; margin-top:4px; line-height:1.35; }\n.nearby-distance-block { text-align:right; }\n.nearby-distance-v8 { color:var(--accent); font-weight:950; font-size:15px; }\n.nearby-distance-label { color:var(--muted); font-size:10px; margin-top:2px; }\n.nearby-star { width:42px; height:42px; border-radius:12px; border:1px solid var(--border); background:transparent; color:var(--muted); font-size:20px; }\n.nearby-star.active { color:var(--warning); background:var(--accent-soft); }\n.nearby-arrivals { display:grid; gap:7px; padding:0 15px 15px; }\n.nearby-arrival { display:grid; grid-template-columns:52px 1fr auto; gap:10px; align-items:center; padding:10px 11px; border:1px solid var(--border); border-radius:13px; }\n.nearby-line { font-weight:950; font-size:17px; }\n.nearby-destination { font-weight:800; font-size:12px; }\n.nearby-bus-distance { color:var(--muted); font-size:10px; margin-top:3px; }\n.nearby-time { font-weight:950; font-size:15px; text-align:right; white-space:nowrap; }\n.nearby-time.now { color:var(--success); } .nearby-time.soon { color:var(--accent); } .nearby-time.later { color:var(--muted); }\n.nearby-no-times { padding:12px; border:1px dashed var(--border); border-radius:12px; color:var(--muted); font-size:12px; }\n.nearby-empty { padding:30px; text-align:center; color:var(--muted); border:1px dashed var(--border); border-radius:16px; }\n.nearby-spinner { display:inline-block; width:14px; height:14px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:nearby-spin .8s linear infinite; vertical-align:-2px; margin-right:7px; }\n@keyframes nearby-spin { to { transform:rotate(360deg); } }\n@media (max-width:760px) {\n  .app-tabs { grid-template-columns:1fr 1fr 1fr; }\n  .app-tab { font-size:11px; }\n  .nearby-hero { grid-template-columns:auto 1fr; }\n  .nearby-locate { grid-column:1 / -1; width:100%; }\n  .nearby-card-head { grid-template-columns:56px 1fr auto; }\n  .nearby-distance-block { grid-column:2; text-align:left; }\n}\n
 /* ===== FAVORITOS ===== */
 .favorites-panel {
     margin-top: 20px;
@@ -846,7 +848,7 @@ pre {
         <div class="logo">🚌</div>
         <div>
             <h1>EMT Madrid</h1>
-            <p class="subtitle">Tiempo real · PMVVisor · sin API Key</p>
+            <p class="subtitle">Tiempo real · EMT Madrid</p>
         </div>
     </div>
 
@@ -857,6 +859,7 @@ pre {
 <nav class="app-tabs" aria-label="Navegación principal">
     <button class="app-tab active" data-tab="home" type="button">⭐ Mis paradas</button>
     <button class="app-tab" data-tab="search" type="button">🔎 Buscar parada</button>
+    <button class="app-tab" data-tab="nearby" type="button">📍 Cerca de mí</button>
 </nav>
 
 <section class="tab-content active" id="tab-home">
@@ -875,6 +878,30 @@ pre {
     </section>
 </section>
 
+<section class="tab-content" id="tab-nearby">
+    <section class="card nearby-hero">
+        <div class="nearby-hero-icon">📍</div>
+        <div class="nearby-hero-content">
+            <div class="nearby-kicker">LOCALIZACIÓN</div>
+            <h2 class="home-title">Paradas cerca de ti</h2>
+            <p class="home-subtitle">Encuentra las paradas más próximas y consulta directamente sus próximos autobuses.</p>
+        </div>
+        <button class="primary nearby-locate" id="nearbyLocateBtn" type="button">📍 Localizarme</button>
+    </section>
+
+    <section class="card nearby-panel">
+        <div class="nearby-panel-header">
+            <div>
+                <h2 class="section-title">Próximas paradas</h2>
+                <p class="section-subtitle" id="nearbyUpdated">Pulsa «Localizarme» para empezar.</p>
+            </div>
+            <button class="small-btn" id="nearbyRefreshBtn" type="button" disabled>↻ Actualizar</button>
+        </div>
+        <div id="nearbyStatusV8" class="nearby-status-v8" hidden></div>
+        <div id="nearbyResultsV8" class="nearby-cards"></div>
+    </section>
+</section>
+
 <section class="tab-content" id="tab-search">
     <div class="search-intro">
         <h2>Buscar una parada</h2>
@@ -889,7 +916,7 @@ pre {
             <h2 class="directory-title">Directorio de paradas</h2>
             <p class="directory-subtitle">Busca por número, nombre, dirección o línea.</p>
         </div>
-        <button class="directory-count nearby-trigger" id="nearbyBtn" type="button">📍 Cerca de mí</button>
+        <div class="directory-count">Directorio EMT</div>
     </div>
 
     <input id="directoryInput" type="search"
@@ -900,8 +927,7 @@ pre {
         <div class="directory-empty">Escribe al menos 2 caracteres para buscar.</div>
     </div>
 
-    <div class="nearby-status" id="nearbyStatus" hidden></div>
-    <div id="nearbyResults" class="nearby-results" hidden></div>
+
 </section>
 
 <section class="card controls">
@@ -1257,9 +1283,9 @@ function activateTab(tabName) {
         section.classList.toggle("active", section.id === `tab-${tabName}`);
     });
 
-    if (tabName === "home") {
-        renderHomeFavorites();
-    }
+    if (tabName === "home") renderHomeFavorites();
+    if (tabName === "nearby") syncNearbyAutoRefresh();
+    else stopNearbyAutoRefresh();
 }
 
 document.querySelectorAll(".app-tab").forEach(button => {
@@ -1623,56 +1649,161 @@ function formatDistance(km) {
     return `${km.toFixed(1)} km`;
 }
 
-function renderNearbyResults(lat, lon) {
-    const container = $("nearbyResults");
+let nearbyPosition = null;
+let nearbyRefreshTimer = null;
+let nearbyLoadToken = 0;
+
+function nearbyTimeClass(minutes) {
+    if (minutes !== null && minutes <= 3) return "now";
+    if (minutes !== null && minutes <= 10) return "soon";
+    return "later";
+}
+
+function favoriteFromStop(stop) {
+    return {
+        parada: String(stop.parada),
+        nombre: stop.nombre || "",
+        direccion: stop.direccion || "",
+        addedAt: Date.now()
+    };
+}
+
+function toggleNearbyFavorite(stop, button) {
+    const favorites = getFavorites();
+    const index = favorites.findIndex(item => String(item.parada) === String(stop.parada));
+
+    if (index >= 0) {
+        favorites.splice(index, 1);
+        button.textContent = "☆";
+        button.classList.remove("active");
+        button.title = "Añadir a favoritos";
+    } else {
+        favorites.unshift(favoriteFromStop(stop));
+        button.textContent = "★";
+        button.classList.add("active");
+        button.title = "Quitar de favoritos";
+    }
+
+    saveFavorites(favorites);
+    renderFavorites();
+    renderHomeFavorites();
+    if (state.data?.parada && String(state.data.parada) === String(stop.parada)) updateFavoriteStar();
+}
+
+async function fetchNearbyStop(stop) {
+    const url = `https://www.emtmadrid.es/PMVVisor/pmv.aspx?stopnum=${encodeURIComponent(stop.parada)}&size=3`;
+    try {
+        const response = await fetch(url, { method: "GET", mode: "cors", cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const html = await response.text();
+        return { stop, data: parsePMV(html), error: null };
+    } catch (error) {
+        return { stop, data: null, error: error.message };
+    }
+}
+
+function renderNearbyCard(result) {
+    const { stop, data, error } = result;
+    const card = document.createElement("article");
+    card.className = "nearby-card";
+
+    const favorite = isFavorite(stop.parada);
+    const star = document.createElement("button");
+    star.type = "button";
+    star.className = `nearby-star${favorite ? " active" : ""}`;
+    star.textContent = favorite ? "★" : "☆";
+    star.title = favorite ? "Quitar de favoritos" : "Añadir a favoritos";
+    star.addEventListener("click", event => { event.stopPropagation(); toggleNearbyFavorite(stop, star); });
+
+    const head = document.createElement("div");
+    head.className = "nearby-card-head";
+    head.innerHTML = `
+        <div class="nearby-stop-number">${escapeHtml(stop.parada)}</div>
+        <div>
+            <div class="nearby-stop-name">${escapeHtml(stop.nombre || "Parada EMT")}</div>
+            <div class="nearby-stop-address">${escapeHtml(stop.direccion || "")}</div>
+        </div>
+        <div class="nearby-distance-block">
+            <div class="nearby-distance-v8">${formatDistance(stop.distance)}</div>
+            <div class="nearby-distance-label">de tu posición</div>
+        </div>
+    `;
+    head.appendChild(star);
+    card.appendChild(head);
+
+    const arrivals = document.createElement("div");
+    arrivals.className = "nearby-arrivals";
+
+    if (error) {
+        arrivals.innerHTML = `<div class="nearby-no-times">No se han podido actualizar los tiempos de esta parada.</div>`;
+    } else if (!data?.estimaciones?.length) {
+        arrivals.innerHTML = `<div class="nearby-no-times">No hay estimaciones disponibles en este momento.</div>`;
+    } else {
+        data.estimaciones.forEach(item => {
+            const row = document.createElement("div");
+            row.className = "nearby-arrival";
+
+            let busDistance = "Posición del autobús no disponible";
+            if (item.bus && Number.isFinite(stop.lat) && Number.isFinite(stop.lon)) {
+                const d = distanceKm(stop.lat, stop.lon, item.bus.lat, item.bus.lon);
+                busDistance = `🚌 ${formatDistance(d)} de la parada`;
+            }
+
+            row.innerHTML = `
+                <div class="nearby-line">${escapeHtml(item.linea)}</div>
+                <div>
+                    <div class="nearby-destination">→ ${escapeHtml(item.destino)}</div>
+                    <div class="nearby-bus-distance">${escapeHtml(busDistance)}</div>
+                </div>
+                <div class="nearby-time ${nearbyTimeClass(item.minutos)}">${escapeHtml(formatTime(item))}</div>
+            `;
+            arrivals.appendChild(row);
+        });
+    }
+
+    card.appendChild(arrivals);
+    card.addEventListener("click", () => {
+        $("stopInput").value = stop.parada;
+        activateTab("search");
+        consultPMV();
+    });
+    return card;
+}
+
+async function loadNearbyTimes() {
+    if (!nearbyPosition) return;
+
+    const token = ++nearbyLoadToken;
+    const container = $("nearbyResultsV8");
+    const status = $("nearbyStatusV8");
+    const refresh = $("nearbyRefreshBtn");
+    refresh.disabled = true;
+    status.hidden = false;
+    status.innerHTML = `<span class="nearby-spinner"></span>Actualizando tiempos de las paradas cercanas...`;
 
     const nearest = STOP_DIRECTORY
         .filter(stop => Number.isFinite(stop.lat) && Number.isFinite(stop.lon))
-        .map(stop => ({ ...stop, distance: distanceKm(lat, lon, stop.lat, stop.lon) }))
+        .map(stop => ({ ...stop, distance: distanceKm(nearbyPosition.lat, nearbyPosition.lon, stop.lat, stop.lon) }))
         .sort((a, b) => a.distance - b.distance)
         .slice(0, 6);
 
+    const results = await Promise.all(nearest.map(fetchNearbyStop));
+    if (token !== nearbyLoadToken) return;
+
     container.innerHTML = "";
-
-    nearest.forEach(stop => {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "nearby-result";
-        button.innerHTML = `
-            <div class="nearby-number">${escapeHtml(stop.parada)}</div>
-            <div>
-                <div class="nearby-name">${escapeHtml(stop.nombre || "Parada EMT")}</div>
-                <div class="nearby-address">${escapeHtml(stop.direccion || "")}</div>
-            </div>
-            <div class="nearby-distance">${formatDistance(stop.distance)}</div>
-        `;
-        button.addEventListener("click", () => {
-            $("stopInput").value = stop.parada;
-            activateTab("search");
-            consultPMV();
-        });
-        container.appendChild(button);
-    });
-
-    container.hidden = false;
+    results.forEach(result => container.appendChild(renderNearbyCard(result)));
+    $("nearbyUpdated").textContent = `Actualizado a las ${new Date().toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" })} · actualización automática cada 30 s`;
+    status.hidden = true;
+    refresh.disabled = false;
 }
 
-function findNearbyStops() {
-    const status = $("nearbyStatus");
+function locateNearby() {
+    const status = $("nearbyStatusV8");
+    const button = $("nearbyLocateBtn");
 
-    // La Geolocation API exige un contexto seguro en móviles.
-    // file:// y content:// (por ejemplo, abrir el HTML desde la app Archivos)
-    // no son una forma fiable de ejecutar la función de ubicación.
     if (!window.isSecureContext) {
         status.hidden = false;
-        status.innerHTML = `
-            <strong>📍 Ubicación no disponible</strong><br>
-            Para usar «Cerca de mí», abre esta aplicación desde una dirección
-            <strong>HTTPS</strong>. Si has abierto el HTML desde «Archivos»,
-            Android usa una dirección <code>content://</code> y el navegador no
-            puede conceder la ubicación a esta página.<br><br>
-            <span>La aplicación seguirá funcionando para buscar paradas y consultar tiempos.</span>
-        `;
+        status.textContent = "Para usar la ubicación, abre la aplicación desde una dirección HTTPS.";
         return;
     }
 
@@ -1682,37 +1813,50 @@ function findNearbyStops() {
         return;
     }
 
-    const token = ++nearbyRequestToken;
-    const button = $("nearbyBtn");
-
-    status.hidden = false;
-    status.textContent = "Obteniendo tu ubicación...";
     button.disabled = true;
+    status.hidden = false;
+    status.innerHTML = `<span class="nearby-spinner"></span>Obteniendo tu ubicación...`;
 
     navigator.geolocation.getCurrentPosition(
-        position => {
-            if (token !== nearbyRequestToken) return;
-            const { latitude, longitude } = position.coords;
-            renderNearbyResults(latitude, longitude);
-            status.textContent = `Paradas más cercanas a ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+        async position => {
+            nearbyPosition = { lat: position.coords.latitude, lon: position.coords.longitude };
             button.disabled = false;
+            status.textContent = `Ubicación detectada · precisión aproximada ${Math.round(position.coords.accuracy)} m`;
+            status.hidden = false;
+            await loadNearbyTimes();
+            syncNearbyAutoRefresh();
         },
         error => {
-            if (token !== nearbyRequestToken) return;
+            button.disabled = false;
             const messages = {
-                1: "Permiso de ubicación denegado. Revisa el permiso de ubicación del navegador para esta página y vuelve a intentarlo.",
+                1: "Permiso de ubicación denegado. Revisa el permiso de ubicación del navegador para esta página.",
                 2: "No se ha podido determinar tu ubicación.",
                 3: "La ubicación ha tardado demasiado en responder."
             };
             status.hidden = false;
             status.textContent = messages[error.code] || "No se ha podido obtener tu ubicación.";
-            button.disabled = false;
         },
-        { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
+        { enableHighAccuracy: true, timeout: 12000, maximumAge: 30000 }
     );
 }
 
-$("nearbyBtn").addEventListener("click", findNearbyStops);
+function stopNearbyAutoRefresh() {
+    if (nearbyRefreshTimer) {
+        clearInterval(nearbyRefreshTimer);
+        nearbyRefreshTimer = null;
+    }
+}
+
+function syncNearbyAutoRefresh() {
+    stopNearbyAutoRefresh();
+    if (!nearbyPosition) return;
+    nearbyRefreshTimer = setInterval(() => {
+        if (document.getElementById("tab-nearby")?.classList.contains("active")) loadNearbyTimes();
+    }, 30000);
+}
+
+$("nearbyLocateBtn").addEventListener("click", locateNearby);
+$("nearbyRefreshBtn").addEventListener("click", loadNearbyTimes);
 
 $("themeBtn").addEventListener("click", () => {
     const root = document.documentElement;
