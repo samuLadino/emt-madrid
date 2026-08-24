@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V9.1</title>
+<title>EMT Madrid · V9.2</title>
 
 <style>
 :root {
@@ -920,7 +920,7 @@ pre {
 }
 
 
-/* ===== V9 · RUTAS ===== */
+/* ===== V9.2 · RUTAS ===== */
 .app-tabs { overflow-x: auto; scrollbar-width: thin; }
 .app-tab { white-space: nowrap; }
 .routes-hero { padding: 22px; margin-bottom: 14px; }
@@ -2131,7 +2131,7 @@ $("themeBtn").addEventListener("click", () => {
 
 $("stopInput").focus();
 
-/* ===== V9 · MOTOR DE RUTAS FRONTEND ===== */
+/* ===== V9.2 · MOTOR DE RUTAS FRONTEND ===== */
 const routeState = {
     csvLoaded: false,
     csvLoading: null,
@@ -2151,12 +2151,65 @@ const ROUTE_MAX_ORIGIN_STOPS = 12;
 const ROUTE_MAX_DEST_STOPS = 12;
 const ROUTE_MAX_RESULTS = 8;
 const ROUTE_MAX_CANDIDATES = 60;
+// La red nocturna EMT (líneas N/NC) se activa automáticamente durante la noche.
+// No se muestra ni se usa como alternativa diurna. PMVVisor sigue siendo la fuente de verdad para las llegadas.
+const ROUTE_NIGHT_START_MIN = 23 * 60;
+const ROUTE_NIGHT_END_MIN = 6 * 60 + 30;
+const ROUTE_LOOP_BACKTRACK_M = 160;
 
 function routeNormalize(value) {
     return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase().trim();
 }
 
 function routeLineKey(line, sentido) { return `${normalizeLine(line)}|${String(sentido)}`; }
+
+function routeIsNightLine(line) {
+    return /^N/.test(normalizeLine(line));
+}
+
+function routeIsNightNow(date = new Date()) {
+    const minutes = date.getHours() * 60 + date.getMinutes();
+    return minutes >= ROUTE_NIGHT_START_MIN || minutes < ROUTE_NIGHT_END_MIN;
+}
+
+function routeServiceAllowed(candidate, date = new Date()) {
+    // De día, las líneas N/NC no participan en la búsqueda.
+    // De noche pueden participar automáticamente junto a cualquier línea diurna
+    // que EMT siga mostrando activa en PMVVisor.
+    if (!candidate?.segments?.some(s => routeIsNightLine(s.line))) return true;
+    return routeIsNightNow(date);
+}
+
+function routeStopDistanceMeters(a, b) {
+    if (!a || !b || !Number.isFinite(a.lat) || !Number.isFinite(a.lon) || !Number.isFinite(b.lat) || !Number.isFinite(b.lon)) return Infinity;
+    return distanceKm(a.lat, a.lon, b.lat, b.lon) * 1000;
+}
+
+function routeHasBacktracking(candidate) {
+    // Evita itinerarios que avanzan por una línea y luego caminan hacia atrás
+    // hasta una parada que ya se había dejado atrás. Es el caso típico de
+    // 1145 -> 1189 -> caminar hasta 1146: parece un transbordo, pero es un rodeo.
+    for (let i = 0; i < candidate.segments.length - 1; i++) {
+        const current = candidate.segments[i];
+        const next = candidate.segments[i + 1];
+        const nextStop = routeStopInfo(next.boardStop);
+        if (!nextStop) continue;
+        const startIndex = current.boardIndex;
+        const endIndex = current.alightIndex;
+        const from = Math.max(startIndex, 0);
+        const to = Math.max(endIndex, from);
+        for (let j = from; j < to; j++) {
+            const previousStop = routeStopInfo(current.dir?.stops?.[j]?.parada || current.dir?.stops?.[j]?.parada);
+            if (!previousStop) continue;
+            if (routeStopDistanceMeters(nextStop, previousStop) <= ROUTE_LOOP_BACKTRACK_M) return true;
+        }
+    }
+    return false;
+}
+
+function routeFilterCandidates(candidates) {
+    return candidates.filter(c => routeServiceAllowed(c) && !routeHasBacktracking(c));
+}
 
 function routeCsvParse(text) {
     const rows = [];
@@ -2310,7 +2363,7 @@ function routePathDistance(dir, fromIndex, toIndex) {
 
 function routeSegment(dir, boardStop, boardIndex, alightStop, alightIndex, wait=0) {
     const distance = routePathDistance(dir, boardIndex, alightIndex);
-    return { type:'bus', line:dir.line, sentido:dir.sentido, terminal:dir.terminal, boardStop, boardIndex, alightStop, alightIndex, distanceKm:distance, rideMin:routeBusMinutes(distance), waitMin:wait, live:null };
+    return { type:'bus', line:dir.line, sentido:dir.sentido, terminal:dir.terminal, dir, boardStop, boardIndex, alightStop, alightIndex, distanceKm:distance, rideMin:routeBusMinutes(distance), waitMin:wait, live:null };
 }
 
 function routeDirectionAtStop(stopId) { return routeState.directionsByStop.get(String(stopId)) || []; }
@@ -2460,18 +2513,20 @@ async function routeApplyLiveTimes(candidates) {
         await new Promise(r=>setTimeout(r,100));
     }
     for(const c of candidates){
-        let liveOkay=true;
         for(const seg of c.segments){
             const data=cache.get(String(seg.boardStop));
             const arr=(data?.estimaciones||[]).filter(x=>normalizeLine(x.linea)===normalizeLine(seg.line));
             if(!arr.length){ seg.waitMin=3; seg.live=null; continue; }
+            // PMVVisor es la fuente de verdad para el sentido de una llegada concreta.
+            // Si el directorio y PMV discrepan, mostramos el destino de PMV en vez de
+            // lanzar un warning que puede ser falso por diferencias de nomenclatura.
             const matching=arr.filter(x=>routeMatchLiveDirection(x,seg.terminal));
-            const best=(matching.length?matching:arr).filter(x=>x.minutos!==null).sort((a,b)=>a.minutos-b.minutos)[0] || (matching[0]||arr[0]);
+            const pool=(matching.length?matching:arr).filter(x=>x.minutos!==null);
+            const best=pool.sort((a,b)=>a.minutos-b.minutos)[0] || (matching[0]||arr[0]);
             seg.live=best;
             seg.waitMin=Number.isFinite(best.minutos)?best.minutos:3;
-            if(matching.length===0) liveOkay=false;
         }
-        c.liveDirectionMismatch=!liveOkay;
+        c.liveDirectionMismatch=false;
         c.totalMin=Math.max(1,routeScore(c));
     }
 }
@@ -2552,7 +2607,7 @@ async function searchRoutes() {
         let candidates=routeDirectCandidates(origins,destinations);
         candidates=candidates.concat(routeOneTransferCandidates(origins,destinations));
         if(candidates.length<10) candidates=candidates.concat(routeTwoTransferCandidates(origins,destinations));
-        candidates=routeDeduplicate(candidates).slice(0,ROUTE_MAX_CANDIDATES);
+        candidates=routeFilterCandidates(routeDeduplicate(candidates)).slice(0,ROUTE_MAX_CANDIDATES);
         if(!candidates.length){ results.innerHTML='<div class="route-empty"><strong>No hemos encontrado una combinación directa o con hasta 2 transbordos.</strong><br>Prueba con otro punto de origen/destino o una zona algo más amplia.</div>'; return; }
         results.innerHTML='<div class="route-loading">Contrastando próximas llegadas con EMT…</div>';
         await routeApplyLiveTimes(candidates);
