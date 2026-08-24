@@ -2048,7 +2048,7 @@ async function loadNearbyTimes() {
         .filter(stop => Number.isFinite(stop.lat) && Number.isFinite(stop.lon))
         .map(stop => ({ ...stop, distance: distanceKm(nearbyPosition.lat, nearbyPosition.lon, stop.lat, stop.lon) }))
         .sort((a, b) => a.distance - b.distance)
-        .slice(0, 6);
+        .slice(0, 16);
 
     const results = await Promise.all(nearest.map(fetchNearbyStop));
     if (token !== nearbyLoadToken) return;
