@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V9</title>
+<title>EMT Madrid · V9.1</title>
 
 <style>
 :root {
@@ -2147,10 +2147,10 @@ const ROUTE_MAX_WALK_KM = 1;
 const ROUTE_MAX_TRANSFERS = 2;
 const ROUTE_WALK_KMH = 4.8;
 const ROUTE_BUS_KMH = 15;
-const ROUTE_MAX_ORIGIN_STOPS = 6;
-const ROUTE_MAX_DEST_STOPS = 6;
+const ROUTE_MAX_ORIGIN_STOPS = 12;
+const ROUTE_MAX_DEST_STOPS = 12;
 const ROUTE_MAX_RESULTS = 8;
-const ROUTE_MAX_CANDIDATES = 32;
+const ROUTE_MAX_CANDIDATES = 60;
 
 function routeNormalize(value) {
     return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase().trim();
@@ -2239,14 +2239,38 @@ async function routeLoadCsv() {
         const headers = rows.shift().map(x => x.replace(/^\uFEFF/, '').trim());
         const idx = Object.fromEntries(headers.map((h,i) => [h,i]));
         const groups = new Map();
+
+        // El CSV contiene recorridos con fechas de vigencia.
+        // Solo cargamos los que están activos hoy.
+        const csvDateKey = value => {
+            const raw = String(value || '').trim();
+            if (!raw) return '';
+            let m = raw.match(/^(\d{2})[\/-](\d{2})[\/-](\d{4})/);
+            if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+            m = raw.match(/^(\d{4})[\/-](\d{2})[\/-](\d{2})/);
+            return m ? `${m[1]}-${m[2]}-${m[3]}` : '';
+        };
+        const now = new Date();
+        const todayKey = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+
         for (const r of rows) {
-            const line = String(r[idx.line] || '').trim();
+            const dateIni = csvDateKey(r[idx.dateIni]);
+            const dateEnd = csvDateKey(r[idx.dateEnd]);
+            if (dateIni && dateIni > todayKey) continue;
+            if (dateEnd && dateEnd < todayKey) continue;
+
+            // LINE es el código interno del recorrido.
+            // LABEL es la identificación pública que debe ver el usuario.
+            const routeCode = String(r[idx.line] || '').trim();
+            const label = String(r[idx.label] || '').trim();
+            const line = label || routeCode;
             const sentido = String(r[idx.sentido] || '').trim();
             const parada = String(r[idx.parada] || '').trim();
             if (!line || !sentido || !parada) continue;
+
             const key = routeLineKey(line, sentido);
             if (!groups.has(key)) groups.set(key, {
-                line: normalizeLine(line), sentido,
+                line: normalizeLine(line), routeCode, sentido,
                 nameFrom: cleanText(r[idx.nameFrom] || ''), nameTo: cleanText(r[idx.nameTo] || ''),
                 stops: []
             });
@@ -2332,7 +2356,7 @@ function routeOneTransferCandidates(origins,destinations) {
                 const transferStop=routeStopInfo(transferId); if(!transferStop) continue;
                 const secondOptions=routeNearbyLineDirections(transferId,ROUTE_MAX_WALK_KM);
                 for(const second of secondOptions){
-                    if(second.dir.key===start.dir.key) continue;
+                    if(normalizeLine(second.dir.line) === normalizeLine(start.dir.line)) continue;
                     for(const d of destinations){
                         const idx2=second.dir.indexByStop.get(String(d.stop.parada));
                         if(idx2===undefined || idx2<=second.index) continue;
@@ -2356,7 +2380,7 @@ function routeTwoTransferCandidates(origins,destinations) {
             for(let i=start.index+1;i<=max;i++){
                 const sid=start.dir.stops[i].parada;
                 const s=routeStopInfo(sid); if(!s) continue;
-                const secondOptions=routeNearbyLineDirections(sid,ROUTE_MAX_WALK_KM).filter(x=>x.dir.key!==start.dir.key).slice(0,18);
+                const secondOptions=routeNearbyLineDirections(sid,ROUTE_MAX_WALK_KM).filter(x=>normalizeLine(x.dir.line)!==normalizeLine(start.dir.line)).slice(0,18);
                 for(const second of secondOptions){
                     firsts.push({o,start,i,sid,second});
                     if(firsts.length>70) break;
@@ -2373,7 +2397,7 @@ function routeTwoTransferCandidates(origins,destinations) {
         for(let j=second.index+1;j<=max;j++){
             const sid2=second.dir.stops[j].parada;
             const s2=routeStopInfo(sid2); if(!s2) continue;
-            const thirdOptions=routeNearbyLineDirections(sid2,ROUTE_MAX_WALK_KM).filter(x=>x.dir.key!==f.start.dir.key && x.dir.key!==second.dir.key).slice(0,14);
+            const thirdOptions=routeNearbyLineDirections(sid2,ROUTE_MAX_WALK_KM).filter(x=>normalizeLine(x.dir.line)!==normalizeLine(f.start.dir.line) && normalizeLine(x.dir.line)!==normalizeLine(second.dir.line)).slice(0,14);
             for(const third of thirdOptions){
                 for(const d of destinations){
                     const idx3=third.dir.indexByStop.get(String(d.stop.parada));
@@ -2454,7 +2478,7 @@ async function routeApplyLiveTimes(candidates) {
 
 async function routeGeocode(input) {
     const raw=String(input||'').trim();
-    const stopMatch=raw.match(/(?:parada\s*)?(\d{1,4})$/i);
+    const stopMatch=raw.match(/^(?:parada\s*)?(\d{1,5})$/i);
     if(stopMatch){
         const s=routeStopInfo(stopMatch[1]);
         if(s) return {lat:s.lat,lon:s.lon,label:`Parada ${s.parada} · ${s.nombre}`,stop:s};
