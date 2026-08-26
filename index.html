@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V9.3</title>
+<title>EMT Madrid · V9.4</title>
 
 <style>
 :root {
@@ -934,6 +934,10 @@ pre {
 .route-swap { width: 44px; height: 44px; border: 1px solid var(--border); border-radius: 13px; background: var(--panel-solid); color: var(--text); font-size: 20px; font-weight: 800; }
 .route-swap:hover { border-color: var(--accent); color: var(--accent); }
 .route-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 14px; }
+.route-controls { display:grid; gap:12px; margin-top:14px; }
+.route-transfer-control { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.route-transfer-control label { font-size:12px; font-weight:850; color:var(--muted); }
+.route-transfer-control select { min-width:190px; height:40px; padding:0 12px; border:1px solid var(--border); border-radius:11px; background:var(--panel-solid); color:var(--text); font:inherit; }
 .route-note { margin: 12px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .route-geocode-status { margin-top: 12px; padding: 10px 12px; border-radius: 12px; background: var(--accent-soft); color: var(--muted); font-size: 12px; }
 .route-results-card { margin-top: 14px; padding: 18px; }
@@ -955,7 +959,6 @@ pre {
 .route-step-live { color:var(--accent); font-weight:800; }
 .route-loading { padding:28px 16px; text-align:center; color:var(--muted); }
 .route-empty { padding:28px 16px; border:1px dashed var(--border); border-radius:16px; color:var(--muted); text-align:center; }
-.route-info-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:14px; }
 .route-info-card { padding:15px; border:1px solid var(--border); border-radius:17px; background:var(--panel); display:grid; gap:5px; }
 .route-info-card strong { font-size:13px; }
 .route-info-card span { color:var(--muted); font-size:11px; line-height:1.45; }
@@ -966,7 +969,6 @@ pre {
     .route-swap { justify-self:center; transform:rotate(90deg); }
     .route-actions { flex-direction:column-reverse; align-items:stretch; }
     .route-actions .primary, .route-actions .small-btn { width:100%; }
-    .route-info-grid { grid-template-columns:1fr; }
     .route-card-head { align-items:flex-start; }
 }
 
@@ -1041,7 +1043,7 @@ pre {
     <section class="card routes-hero">
         <div class="routes-kicker">PLANIFICADOR</div>
         <h2 class="home-title">Rutas</h2>
-        <p class="home-subtitle">Indica un origen y un destino para encontrar itinerarios de EMT con el menor tiempo estimado y hasta 2 transbordos.</p>
+        <p class="home-subtitle">Indica un origen y un destino para encontrar itinerarios de EMT con el menor tiempo estimado y hasta el número de transbordos que elijas.</p>
     </section>
 
     <section class="card routes-form-card">
@@ -1062,11 +1064,25 @@ pre {
                 </div>
             </div>
         </div>
-        <div class="route-actions">
-            <button class="small-btn" id="routeUseLocationBtn" type="button">📍 Usar mi ubicación como origen</button>
-            <button class="primary" id="routeSearchBtn" type="button">Buscar rutas</button>
+        <div class="route-controls">
+            <div class="route-transfer-control">
+                <label for="routeMaxTransfers">Máximo de transbordos</label>
+                <select id="routeMaxTransfers" aria-label="Máximo de transbordos">
+                    <option value="0">0 · Solo directo</option>
+                    <option value="1">1 transbordo</option>
+                    <option value="2" selected>2 transbordos</option>
+                    <option value="3">3 transbordos</option>
+                    <option value="4">4 transbordos</option>
+                    <option value="5">5 transbordos</option>
+                    <option value="6">6 transbordos</option>
+                </select>
+            </div>
+            <div class="route-actions">
+                <button class="small-btn" id="routeUseLocationBtn" type="button">📍 Usar mi ubicación como origen</button>
+                <button class="primary" id="routeSearchBtn" type="button">Buscar rutas</button>
+            </div>
         </div>
-        <p class="route-note">Se consideran correspondencias a pie de hasta 1 km. Las esperas se contrastan con EMT cuando es posible; el tiempo entre paradas es una estimación. Geocodificación mediante OpenStreetMap/Nominatim.</p>
+        <p class="route-note">El máximo de transbordos es configurable. Las correspondencias a pie se limitan a 1 km. Las esperas se contrastan con EMT cuando es posible; el tiempo entre paradas es una estimación.</p>
         <div class="route-geocode-status" id="routeGeocodeStatus" hidden></div>
     </section>
 
@@ -1081,20 +1097,6 @@ pre {
         <div id="routeResults" class="route-results"></div>
     </section>
 
-    <section class="route-info-grid">
-        <div class="route-info-card">
-            <strong>🚌 Hasta 2 transbordos</strong>
-            <span>Se priorizan itinerarios sencillos y se evita generar combinaciones excesivas.</span>
-        </div>
-        <div class="route-info-card">
-            <strong>🚶 Máximo 1 km a pie</strong>
-            <span>Las correspondencias entre paradas se limitan a un kilómetro.</span>
-        </div>
-        <div class="route-info-card">
-            <strong>⏱️ Ordenadas por tiempo</strong>
-            <span>Las rutas se ordenan por el tiempo total estimado, incluyendo esperas y caminatas.</span>
-        </div>
-    </section>
 </section>
 
 <section class="tab-content" id="tab-search">
@@ -2044,14 +2046,13 @@ async function loadNearbyTimes() {
     status.hidden = false;
     status.innerHTML = `<span class="nearby-spinner"></span>Actualizando tiempos de las paradas cercanas...`;
 
-    // Cerca de mí: máximo 6 paradas, únicamente dentro de un radio de 1 km,
+    // Cerca de mí: todas las paradas dentro de un radio de 1 km,
     // siempre ordenadas desde la más cercana hasta la más lejana.
     const nearest = STOP_DIRECTORY
         .filter(stop => Number.isFinite(stop.lat) && Number.isFinite(stop.lon))
         .map(stop => ({ ...stop, distance: distanceKm(nearbyPosition.lat, nearbyPosition.lon, stop.lat, stop.lon) }))
         .filter(stop => stop.distance <= 1.0)
-        .sort((a, b) => a.distance - b.distance)
-        .slice(0, 6);
+        .sort((a, b) => a.distance - b.distance);
 
     if (!nearest.length) {
         container.innerHTML = `<div class="route-empty"><strong>No hay paradas EMT a menos de 1 km.</strong><br>Prueba a actualizar tu ubicación o desplazarte a una zona con más paradas.</div>`;
@@ -2155,7 +2156,8 @@ const routeState = {
 };
 
 const ROUTE_MAX_WALK_KM = 1;
-const ROUTE_MAX_TRANSFERS = 2;
+const ROUTE_MAX_TRANSFERS_DEFAULT = 2;
+const ROUTE_MAX_TRANSFERS_SAFE = 6;
 const ROUTE_WALK_KMH = 4.8;
 const ROUTE_BUS_KMH = 15;
 const ROUTE_MAX_ORIGIN_STOPS = 12;
@@ -2484,6 +2486,109 @@ function routeTwoTransferCandidates(origins,destinations) {
     return out;
 }
 
+
+function routeMultiTransferCandidates(origins, destinations, maxTransfers) {
+    if (maxTransfers <= 2) return [];
+    const out = [], seen = new Set();
+    const MAX_STATES = 900;
+    const MAX_STOPS_FORWARD = 45;
+    const MAX_TRANSFER_OPTIONS = 12;
+    const queue = [];
+
+    // Seed with every direction available at each origin stop.
+    for (const o of origins) {
+        for (const start of routeDirectionAtStop(o.stop.parada)) {
+            queue.push({
+                origin: o,
+                segments: [],
+                dir: start.dir,
+                index: start.index,
+                currentStop: start.stop,
+                transferWalks: [],
+                transferWalkKm: 0,
+                transfers: 0,
+                usedLines: new Set([normalizeLine(start.dir.line)])
+            });
+        }
+    }
+
+    let processed = 0;
+    while (queue.length && processed < MAX_STATES) {
+        const state = queue.shift();
+        processed++;
+
+        // If this direction reaches any destination, emit a candidate.
+        for (const d of destinations) {
+            const idx = state.dir.indexByStop.get(String(d.stop.parada));
+            if (idx === undefined || idx <= state.index) continue;
+
+            const finalSegment = routeSegment(
+                state.dir,
+                state.currentStop,
+                state.index,
+                d.stop.parada,
+                idx,
+                0
+            );
+            const segments = state.segments.concat(finalSegment);
+            const signature = segments.map(x => `${x.line}|${x.sentido}|${x.boardStop}|${x.alightStop}`).join('>');
+            if (seen.has(signature)) continue;
+            seen.add(signature);
+            out.push({
+                transfers: state.transfers,
+                walkStart: state.origin.distanceKm,
+                walkEnd: d.distanceKm,
+                segments,
+                transferWalkKm: state.transferWalkKm,
+                transferWalks: state.transferWalks.slice()
+            });
+        }
+
+        if (state.transfers >= maxTransfers) continue;
+
+        const end = Math.min(state.dir.stops.length - 1, state.index + MAX_STOPS_FORWARD);
+        for (let i = state.index + 1; i <= end; i++) {
+            const sid = state.dir.stops[i].parada;
+            if (!routeStopInfo(sid)) continue;
+
+            const options = routeNearbyLineDirections(sid, ROUTE_MAX_WALK_KM)
+                .filter(x => !state.usedLines.has(normalizeLine(x.dir.line)))
+                .filter(x => x.index >= 0)
+                .sort((a, b) => a.walkKm - b.walkKm)
+                .slice(0, MAX_TRANSFER_OPTIONS);
+
+            for (const next of options) {
+                if (next.index >= next.dir.stops.length - 1) continue;
+
+                const segment = routeSegment(
+                    state.dir,
+                    state.currentStop,
+                    state.index,
+                    sid,
+                    i,
+                    0
+                );
+
+                const usedLines = new Set(state.usedLines);
+                usedLines.add(normalizeLine(next.dir.line));
+
+                queue.push({
+                    origin: state.origin,
+                    segments: state.segments.concat(segment),
+                    dir: next.dir,
+                    index: next.index,
+                    currentStop: next.transferStop.parada,
+                    transferWalks: state.transferWalks.concat(next.walkKm),
+                    transferWalkKm: state.transferWalkKm + next.walkKm,
+                    transfers: state.transfers + 1,
+                    usedLines
+                });
+            }
+        }
+    }
+    return out;
+}
+
 function routeDeduplicate(candidates) {
     const map=new Map();
     for(const c of candidates){
@@ -2615,17 +2720,20 @@ async function searchRoutes() {
         const destinations=routeNearbyStops(destination.lat,destination.lon,ROUTE_MAX_WALK_KM,ROUTE_MAX_DEST_STOPS);
         if(!origins.length||!destinations.length) throw new Error('No hay paradas EMT a menos de 1 km de uno de los puntos indicados.');
         status.textContent=`Origen: ${origin.label} · Destino: ${destination.label}`;
+        const maxTransfers = Math.max(0, Math.min(ROUTE_MAX_TRANSFERS_SAFE, Number($('routeMaxTransfers')?.value ?? ROUTE_MAX_TRANSFERS_DEFAULT)));
         let candidates=routeDirectCandidates(origins,destinations);
-        candidates=candidates.concat(routeOneTransferCandidates(origins,destinations));
-        if(candidates.length<10) candidates=candidates.concat(routeTwoTransferCandidates(origins,destinations));
+        if(maxTransfers >= 1) candidates=candidates.concat(routeOneTransferCandidates(origins,destinations));
+        if(maxTransfers >= 2) candidates=candidates.concat(routeTwoTransferCandidates(origins,destinations));
+        if(maxTransfers >= 3) candidates=candidates.concat(routeMultiTransferCandidates(origins,destinations,maxTransfers));
+        candidates=candidates.filter(c=>c.transfers<=maxTransfers);
         candidates=routeFilterCandidates(routeDeduplicate(candidates)).slice(0,ROUTE_MAX_CANDIDATES);
-        if(!candidates.length){ results.innerHTML='<div class="route-empty"><strong>No hemos encontrado una combinación directa o con hasta 2 transbordos.</strong><br>Prueba con otro punto de origen/destino o una zona algo más amplia.</div>'; return; }
+        if(!candidates.length){ results.innerHTML=`<div class="route-empty"><strong>No hemos encontrado una ruta con hasta ${maxTransfers} transbordo${maxTransfers===1?'':'s'}.</strong><br>Prueba con otro punto de origen/destino o aumenta el máximo de transbordos.</div>`; return; }
         results.innerHTML='<div class="route-loading">Contrastando próximas llegadas con EMT…</div>';
         await routeApplyLiveTimes(candidates);
         if(token!==routeState.routeToken)return;
         candidates.sort((a,b)=>a.totalMin-b.totalMin || a.transfers-b.transfers);
         const top=candidates.slice(0,ROUTE_MAX_RESULTS);
-        $('routeResultsSummary').textContent=`${top.length} opción${top.length===1?'':'es'} · ordenadas por tiempo estimado`;
+        $('routeResultsSummary').textContent=`${top.length} opción${top.length===1?'':'es'} · hasta ${maxTransfers} transbordo${maxTransfers===1?'':'s'} · ordenadas por tiempo estimado`;
         results.innerHTML=top.map(routeResultHtml).join('');
     }catch(error){
         if(token!==routeState.routeToken)return;
