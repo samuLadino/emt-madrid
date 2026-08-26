@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V9.2</title>
+<title>EMT Madrid · V9.3</title>
 
 <style>
 :root {
@@ -2044,18 +2044,29 @@ async function loadNearbyTimes() {
     status.hidden = false;
     status.innerHTML = `<span class="nearby-spinner"></span>Actualizando tiempos de las paradas cercanas...`;
 
+    // Cerca de mí: máximo 6 paradas, únicamente dentro de un radio de 1 km,
+    // siempre ordenadas desde la más cercana hasta la más lejana.
     const nearest = STOP_DIRECTORY
         .filter(stop => Number.isFinite(stop.lat) && Number.isFinite(stop.lon))
         .map(stop => ({ ...stop, distance: distanceKm(nearbyPosition.lat, nearbyPosition.lon, stop.lat, stop.lon) }))
+        .filter(stop => stop.distance <= 1.0)
         .sort((a, b) => a.distance - b.distance)
-        .slice(0, 16);
+        .slice(0, 6);
+
+    if (!nearest.length) {
+        container.innerHTML = `<div class="route-empty"><strong>No hay paradas EMT a menos de 1 km.</strong><br>Prueba a actualizar tu ubicación o desplazarte a una zona con más paradas.</div>`;
+        $("nearbyUpdated").textContent = "Sin paradas encontradas en un radio de 1 km";
+        status.hidden = true;
+        refresh.disabled = false;
+        return;
+    }
 
     const results = await Promise.all(nearest.map(fetchNearbyStop));
     if (token !== nearbyLoadToken) return;
 
     container.innerHTML = "";
     results.forEach(result => container.appendChild(renderNearbyCard(result)));
-    $("nearbyUpdated").textContent = `Actualizado a las ${new Date().toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" })} · actualización automática cada 30 s`;
+    $("nearbyUpdated").textContent = `${nearest.length} parada${nearest.length === 1 ? "" : "s"} encontrada${nearest.length === 1 ? "" : "s"} en un radio de 1 km · ordenadas por distancia · actualizado a las ${new Date().toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
     status.hidden = true;
     refresh.disabled = false;
 }
