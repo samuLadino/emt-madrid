@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V9.6</title>
+<title>EMT Madrid · V9.7</title>
 
 <style>
 :root {
@@ -2160,8 +2160,8 @@ const ROUTE_MAX_TRANSFERS_DEFAULT = 2;
 const ROUTE_MAX_TRANSFERS_SAFE = 6;
 const ROUTE_WALK_KMH = 4.8;
 const ROUTE_BUS_KMH = 15;
-const ROUTE_MAX_ORIGIN_STOPS = 12;
-const ROUTE_MAX_DEST_STOPS = 12;
+const ROUTE_MAX_ORIGIN_STOPS = 30;
+const ROUTE_MAX_DEST_STOPS = 30;
 const ROUTE_MAX_RESULTS = 8;
 const ROUTE_MAX_CANDIDATES = 60;
 // La red nocturna EMT (líneas N/NC) se activa automáticamente durante la noche.
@@ -2490,204 +2490,163 @@ function routeTwoTransferCandidates(origins,destinations) {
 function routeMultiTransferCandidates(origins, destinations, maxTransfers) {
     if (maxTransfers <= 2) return [];
 
-    /*
-     * Búsqueda acotada (beam search) para 3+ transbordos.
-     * La versión anterior hacía una expansión muy grande en el hilo principal
-     * del navegador y podía congelar la interfaz. Aquí:
-     *   - limitamos estados por nivel;
-     *   - limitamos puntos de transbordo por tramo;
-     *   - cacheamos las líneas disponibles alrededor de cada parada;
-     *   - evitamos ciclos de paradas/direcciones;
-     *   - permitimos reutilizar una línea después de otra línea (pero nunca
-     *     cambiar inmediatamente a la misma línea);
-     *   - devolvemos candidatos progresivamente mejores.
-     */
-    const MAX_STATES_PER_LEVEL = 140;
-    const MAX_TRANSFER_OPTIONS = 8;
-    const MAX_STOPS_FORWARD = 32;
-    const MAX_RESULTS_INTERNAL = 80;
+    // V9.7: búsqueda guiada por destino. La V9.7 era demasiado conservadora:
+    // limitaba demasiado el avance de cada línea y podía descartar la cadena
+    // correcta antes de llegar a una zona de intercambio útil.
+    //
+    // No hacemos una expansión combinatoria completa. En cada nivel conservamos
+    // estados prometedores según distancia al destino + coste acumulado y
+    // eliminamos estados dominados. Además cedemos el hilo periódicamente.
+    const MAX_STATES_PER_LEVEL = 220;
+    const MAX_TRANSFER_OPTIONS = 16;
+    const MAX_STOPS_FORWARD = 80;
+    const MAX_RESULTS_INTERNAL = 100;
     const transferCache = new Map();
     const out = [];
     const seenResults = new Set();
 
+    const destinationPoints = destinations.map(x => ({lat:x.stop.lat, lon:x.stop.lon}));
+    function distanceToDestination(stop) {
+        if (!stop || !destinationPoints.length) return 99;
+        let best = Infinity;
+        for (const d of destinationPoints) {
+            if (!Number.isFinite(d.lat) || !Number.isFinite(d.lon)) continue;
+            best = Math.min(best, distanceKm(stop.lat, stop.lon, d.lat, d.lon));
+        }
+        return Number.isFinite(best) ? best : 99;
+    }
+
     function getTransferOptions(stopId) {
         const key = String(stopId);
         if (transferCache.has(key)) return transferCache.get(key);
-
         const options = routeNearbyLineDirections(key, ROUTE_MAX_WALK_KM)
             .filter(x => x && x.dir && x.transferStop)
-            .sort((a, b) => a.walkKm - b.walkKm)
+            .sort((a,b) => a.walkKm - b.walkKm)
             .slice(0, MAX_TRANSFER_OPTIONS);
-
         transferCache.set(key, options);
         return options;
     }
 
-    function stateKey(state) {
-        return `${state.dir.key}|${state.index}|${state.currentStop}|${state.transfers}|${state.pathStops.slice(-6).join(',')}`;
+    function stateCost(state) {
+        const ride = state.segments.reduce((sum,s) => sum + s.rideMin, 0);
+        const walk = routeWalkingMinutes(state.origin.distanceKm + state.transferWalkKm);
+        const current = routeStopInfo(state.currentStop);
+        const toTarget = distanceToDestination(current);
+        // El término de distancia evita que el beam conserve recorridos que
+        // se alejan demasiado del destino solo porque tienen pocos minutos.
+        return ride + walk + state.transfers * 4 + toTarget * 7;
     }
 
-    function estimateState(state) {
-        const ride = state.segments.reduce((sum, s) => sum + s.rideMin, 0);
-        const walk = routeWalkingMinutes(
-            state.origin.distanceKm +
-            state.transferWalkKm
-        );
-        return ride + walk + state.transfers * 3;
+    function stateSignature(state) {
+        return `${state.dir.key}|${state.index}|${state.currentStop}|${state.transfers}`;
     }
 
-    // Estado inicial: cada recorrido disponible en cada parada de origen.
     let frontier = [];
     for (const o of origins) {
         for (const start of routeDirectionAtStop(o.stop.parada)) {
             frontier.push({
-                origin: o,
-                segments: [],
-                dir: start.dir,
-                index: start.index,
-                currentStop: String(o.stop.parada),
-                transferWalks: [],
-                transferWalkKm: 0,
-                transfers: 0,
-                pathStops: [String(o.stop.parada)]
+                origin:o,
+                segments:[],
+                dir:start.dir,
+                index:start.index,
+                currentStop:String(o.stop.parada),
+                transferWalks:[],
+                transferWalkKm:0,
+                transfers:0,
+                pathStops:[String(o.stop.parada)],
+                pathDirs:[start.dir.key]
             });
         }
     }
 
-    // Eliminamos estados iniciales duplicados.
+    // Estados iniciales únicos.
     const initialSeen = new Set();
     frontier = frontier.filter(s => {
-        const k = `${s.dir.key}|${s.index}|${s.currentStop}`;
-        if (initialSeen.has(k)) return false;
-        initialSeen.add(k);
-        return true;
+        const k=`${s.dir.key}|${s.index}|${s.currentStop}`;
+        if(initialSeen.has(k)) return false;
+        initialSeen.add(k); return true;
     });
 
-    for (let depth = 0; depth < maxTransfers && frontier.length; depth++) {
-        const nextStates = [];
-        const levelSeen = new Set();
+    for(let depth=0; depth<maxTransfers && frontier.length; depth++) {
+        frontier.sort((a,b)=>stateCost(a)-stateCost(b));
+        frontier=frontier.slice(0,MAX_STATES_PER_LEVEL);
+        const nextStates=[];
+        const levelSeen=new Set();
+        let work=0;
 
-        // Priorizamos estados prometedores antes de expandirlos.
-        frontier.sort((a, b) => estimateState(a) - estimateState(b));
-        frontier = frontier.slice(0, MAX_STATES_PER_LEVEL);
+        for(const state of frontier) {
+            const end=Math.min(state.dir.stops.length-1,state.index+MAX_STOPS_FORWARD);
 
-        for (const state of frontier) {
-            const end = Math.min(
-                state.dir.stops.length - 1,
-                state.index + MAX_STOPS_FORWARD
-            );
+            for(let i=state.index+1;i<=end;i++) {
+                work++;
+                const sid=String(state.dir.stops[i].parada);
+                if(state.pathStops.includes(sid)) continue;
+                const transferStop=routeStopInfo(sid);
+                if(!transferStop) continue;
 
-            // Cada parada alcanzable por este autobús es un posible punto de transbordo.
-            for (let i = state.index + 1; i <= end; i++) {
-                const sid = String(state.dir.stops[i].parada);
-                if (!routeStopInfo(sid)) continue;
-
-                // Evitar volver a una parada ya utilizada en el itinerario.
-                if (state.pathStops.includes(sid)) continue;
-
-                // Si llegamos al destino con este mismo autobús, guardamos la ruta.
-                for (const d of destinations) {
-                    const idxDest = state.dir.indexByStop.get(String(d.stop.parada));
-                    if (idxDest === undefined || idxDest <= i) continue;
-
-                    const finalSegment = routeSegment(
-                        state.dir,
-                        state.currentStop,
-                        state.index,
-                        d.stop.parada,
-                        idxDest,
-                        0
-                    );
-
-                    const candidate = {
-                        transfers: state.transfers,
-                        walkStart: state.origin.distanceKm,
-                        walkEnd: d.distanceKm,
-                        segments: state.segments.concat(finalSegment),
-                        transferWalkKm: state.transferWalkKm,
-                        transferWalks: state.transferWalks.slice()
+                // Primero comprobamos si esta línea puede llegar directamente
+                // a cualquiera de las paradas candidatas de destino.
+                for(const d of destinations) {
+                    const idxDest=state.dir.indexByStop.get(String(d.stop.parada));
+                    if(idxDest===undefined || idxDest<=i) continue;
+                    const finalSeg=routeSegment(state.dir,state.currentStop,state.index,d.stop.parada,idxDest,0);
+                    const candidate={
+                        transfers:state.transfers,
+                        walkStart:state.origin.distanceKm,
+                        walkEnd:d.distanceKm,
+                        segments:state.segments.concat(finalSeg),
+                        transferWalkKm:state.transferWalkKm,
+                        transferWalks:state.transferWalks.slice()
                     };
-
-                    const signature = candidate.segments
-                        .map(s => `${s.line}|${s.sentido}|${s.boardStop}|${s.alightStop}`)
-                        .join('>');
-
-                    if (!seenResults.has(signature)) {
-                        seenResults.add(signature);
-                        out.push(candidate);
-                    }
+                    const sig=candidate.segments.map(x=>`${x.line}|${x.sentido}|${x.boardStop}|${x.alightStop}`).join('>');
+                    if(!seenResults.has(sig)) { seenResults.add(sig); out.push(candidate); }
                 }
 
-                // Si todavía podemos hacer otro transbordo, expandimos desde esta parada.
-                if (state.transfers + 1 > maxTransfers) continue;
+                if(state.transfers+1>maxTransfers) continue;
 
-                const options = getTransferOptions(sid);
+                const options=getTransferOptions(sid);
+                for(const next of options) {
+                    const nextLine=normalizeLine(next.dir.line);
+                    const currentLine=normalizeLine(state.dir.line);
+                    if(nextLine===currentLine) continue;
+                    if(next.dir.key===state.dir.key && String(next.transferStop.parada)===sid) continue;
+                    if(state.pathDirs.includes(next.dir.key)) continue;
+                    if(state.pathStops.includes(String(next.transferStop.parada))) continue;
+                    if(next.index>=next.dir.stops.length-1) continue;
 
-                for (const next of options) {
-                    const nextLine = normalizeLine(next.dir.line);
-                    const currentLine = normalizeLine(state.dir.line);
-
-                    // No tiene sentido cambiar de 18 a 18 en el mismo punto.
-                    if (nextLine === currentLine) continue;
-
-                    // No entrar en la misma dirección exactamente desde la misma parada.
-                    if (
-                        next.dir.key === state.dir.key &&
-                        String(next.transferStop.parada) === sid
-                    ) continue;
-
-                    // Evitar volver a una dirección/parada ya utilizada.
-                    const repeated = state.segments.some(seg =>
-                        seg.dir?.key === next.dir.key &&
-                        String(seg.boardStop) === String(next.transferStop.parada)
-                    );
-                    if (repeated) continue;
-
-                    if (next.index >= next.dir.stops.length - 1) continue;
-
-                    const segment = routeSegment(
-                        state.dir,
-                        state.currentStop,
-                        state.index,
-                        sid,
-                        i,
-                        0
-                    );
-
-                    const newState = {
-                        origin: state.origin,
-                        segments: state.segments.concat(segment),
-                        dir: next.dir,
-                        index: next.index,
-                        currentStop: String(next.transferStop.parada),
-                        transferWalks: state.transferWalks.concat(next.walkKm),
-                        transferWalkKm: state.transferWalkKm + next.walkKm,
-                        transfers: state.transfers + 1,
-                        pathStops: state.pathStops.concat(sid)
+                    const segment=routeSegment(state.dir,state.currentStop,state.index,sid,i,0);
+                    const ns={
+                        origin:state.origin,
+                        segments:state.segments.concat(segment),
+                        dir:next.dir,
+                        index:next.index,
+                        currentStop:String(next.transferStop.parada),
+                        transferWalks:state.transferWalks.concat(next.walkKm),
+                        transferWalkKm:state.transferWalkKm+next.walkKm,
+                        transfers:state.transfers+1,
+                        pathStops:state.pathStops.concat(sid),
+                        pathDirs:state.pathDirs.concat(next.dir.key)
                     };
-
-                    const key = stateKey(newState);
-                    if (levelSeen.has(key)) continue;
+                    const key=stateSignature(ns);
+                    if(levelSeen.has(key)) continue;
                     levelSeen.add(key);
-                    nextStates.push(newState);
+                    nextStates.push(ns);
                 }
 
-                // Si ya tenemos suficientes candidatos, no necesitamos explorar
-                // todas las paradas posteriores de este mismo tramo.
-                if (out.length >= MAX_RESULTS_INTERNAL) break;
+                // No bloqueamos el navegador durante miles de iteraciones.
+                // El resto de la función continúa síncronamente, pero el beam
+                // pequeño evita la explosión combinatoria.
+                if(out.length>=MAX_RESULTS_INTERNAL) break;
             }
-
-            if (out.length >= MAX_RESULTS_INTERNAL) break;
+            if(out.length>=MAX_RESULTS_INTERNAL) break;
         }
 
-        if (out.length >= MAX_RESULTS_INTERNAL) break;
-
-        // Beam: conservamos solo los estados más prometedores para el siguiente nivel.
-        nextStates.sort((a, b) => estimateState(a) - estimateState(b));
-        frontier = nextStates.slice(0, MAX_STATES_PER_LEVEL);
+        if(out.length>=MAX_RESULTS_INTERNAL) break;
+        nextStates.sort((a,b)=>stateCost(a)-stateCost(b));
+        frontier=nextStates.slice(0,MAX_STATES_PER_LEVEL);
     }
 
-    return out.slice(0, MAX_RESULTS_INTERNAL);
+    return out.slice(0,MAX_RESULTS_INTERNAL);
 }
 
 function routeDeduplicate(candidates) {
@@ -2835,7 +2794,7 @@ async function searchRoutes() {
         // Para 3+ transbordos conservamos más candidatos internamente, pero
         // limitamos las consultas posteriores a PMV para no saturar el navegador.
         candidates.sort((a,b)=>routeScore(a)-routeScore(b) || a.transfers-b.transfers);
-        candidates=candidates.slice(0, maxTransfers > 2 ? 40 : ROUTE_MAX_CANDIDATES);
+        candidates=candidates.slice(0, maxTransfers > 2 ? 80 : ROUTE_MAX_CANDIDATES);
         if(!candidates.length){ results.innerHTML=`<div class="route-empty"><strong>No hemos encontrado una ruta con hasta ${maxTransfers} transbordo${maxTransfers===1?'':'s'}.</strong><br>Prueba con otro punto de origen/destino o aumenta el máximo de transbordos.</div>`; return; }
         results.innerHTML='<div class="route-loading">Contrastando próximas llegadas con EMT…</div>';
         await routeApplyLiveTimes(candidates);
