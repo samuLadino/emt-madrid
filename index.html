@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V10</title>
+<title>EMT Madrid · V10.1</title>
 
 <style>
 :root {
@@ -977,7 +977,11 @@ pre {
 <script>
 // ===== CONTADOR DE USUARIOS =====
 // Crea un sitio gratuito en GoatCounter y coloca aquí su código, por ejemplo: "emt-madrid".
-// No pongas la URL completa; solo el código que aparece antes de .goatcounter.com.
+// GoatCounter · contador público de visitas de la demo.
+// El tracking se carga normalmente y el contador visible usa el endpoint
+// público documentado por GoatCounter. Probamos la ruta actual y, como
+// respaldo, la raíz del sitio, porque la página puede registrarse con uno
+// u otro path según la configuración del sitio.
 const GOATCOUNTER_CODE = "emtmadrid";
 if (GOATCOUNTER_CODE) {
     const gcScript = document.createElement("script");
@@ -986,25 +990,37 @@ if (GOATCOUNTER_CODE) {
     gcScript.src = "https://gc.zgo.at/count.js";
     document.head.appendChild(gcScript);
 
-    const showVisitorCount = () => {
-        if (!window.goatcounter?.get_data) return;
-        const path = window.goatcounter.get_data().p || "/";
-        fetch(`https://${GOATCOUNTER_CODE}.goatcounter.com/counter/${encodeURIComponent(path)}.json`, {cache:"no-store"})
-            .then(r => r.ok ? r.json() : null)
-            .then(data => {
-                if (!data) return;
-                $("visitorCount").textContent = data.count ?? "—";
-                $("visitorCounter").hidden = false;
-            })
-            .catch(() => {});
+    const showVisitorCount = async () => {
+        const candidates = [];
+        const currentPath = window.location.pathname || "/";
+        candidates.push(currentPath);
+        if (currentPath !== "/") candidates.push("/");
+
+        for (const path of candidates) {
+            try {
+                const url = `https://${GOATCOUNTER_CODE}.goatcounter.com/counter/${encodeURIComponent(path)}.json`;
+                const response = await fetch(url, {cache:"no-store", mode:"cors"});
+                if (!response.ok) continue;
+                const data = await response.json();
+                if (data && data.count !== undefined) {
+                    $("visitorCount").textContent = data.count;
+                    $("visitorCounter").hidden = false;
+                    return;
+                }
+            } catch (_) {}
+        }
     };
+
+    // count.js debe estar cargado antes de depender de get_data(); esperamos
+    // un poco, pero el contador también puede funcionar con la ruta actual.
+    let attempts = 0;
     const gcTimer = setInterval(() => {
-        if (window.goatcounter?.get_data) {
+        attempts++;
+        if (window.goatcounter?.get_data || attempts >= 25) {
             clearInterval(gcTimer);
             showVisitorCount();
         }
     }, 200);
-    setTimeout(() => clearInterval(gcTimer), 10000);
 }
 </script>
 </head>
@@ -1102,7 +1118,7 @@ if (GOATCOUNTER_CODE) {
             <button class="small-btn" id="routeUseLocationBtn" type="button">📍 Usar mi ubicación como origen</button>
             <button class="primary" id="routeSearchBtn" type="button">Buscar rutas</button>
         </div>
-        <p class="route-note">Se muestran las alternativas disponibles ahora, priorizando primero el menor tiempo total y, a igualdad de tiempo, menos transbordos. No se muestran rutas cuya primera salida EMT esté a 30 minutos o más. Las correspondencias a pie se limitan a 1 km.</p>
+        <p class="route-note">Se muestran las alternativas que pueden realizarse con las salidas EMT disponibles en el momento de la consulta, ordenadas por tiempo total y, a igualdad de tiempo, por menos transbordos. Las correspondencias a pie se limitan a 1 km y el cambio entre servicio diurno y nocturno es automático.</p>
         <div class="route-geocode-status" id="routeGeocodeStatus" hidden></div>
     </section>
 
@@ -1205,7 +1221,7 @@ if (GOATCOUNTER_CODE) {
 
 <div class="footer">
     Datos obtenidos directamente de EMT
-    <span id="visitorCounter" class="visitor-counter" hidden>👥 Usuarios: <strong id="visitorCount">—</strong></span>
+    <span id="visitorCounter" class="visitor-counter" hidden>👁️ Visitas a la demo: <strong id="visitorCount">—</strong></span>
 </div>
 
 </div>
@@ -2178,17 +2194,14 @@ const routeState = {
 
 const ROUTE_MAX_WALK_KM = 1;
 const ROUTE_AUTO_MAX_TRANSFERS = 4;
-const ROUTE_LIVE_FIRST_DEPARTURE_MAX_MIN = 30;
 const ROUTE_WALK_KMH = 4.8;
 const ROUTE_BUS_KMH = 15;
 const ROUTE_MAX_ORIGIN_STOPS = 30;
 const ROUTE_MAX_DEST_STOPS = 30;
 const ROUTE_MAX_RESULTS = 8;
 const ROUTE_MAX_CANDIDATES = 60;
-// La red nocturna EMT (líneas N/NC) se activa automáticamente durante la noche.
-// No se muestra ni se usa como alternativa diurna. PMVVisor sigue siendo la fuente de verdad para las llegadas.
-const ROUTE_NIGHT_START_MIN = 23 * 60;
-const ROUTE_NIGHT_END_MIN = 6 * 60 + 30;
+// La disponibilidad diurna/nocturna no se decide por una hora fija.
+// El CSV aporta el recorrido y PMVVisor decide qué línea tiene salida REAL ahora.
 const ROUTE_LOOP_BACKTRACK_M = 160;
 
 function routeNormalize(value) {
@@ -2197,21 +2210,11 @@ function routeNormalize(value) {
 
 function routeLineKey(line, sentido) { return `${normalizeLine(line)}|${String(sentido)}`; }
 
-function routeIsNightLine(line) {
-    return /^N/.test(normalizeLine(line));
-}
-
-function routeIsNightNow(date = new Date()) {
-    const minutes = date.getHours() * 60 + date.getMinutes();
-    return minutes >= ROUTE_NIGHT_START_MIN || minutes < ROUTE_NIGHT_END_MIN;
-}
-
-function routeServiceAllowed(candidate, date = new Date()) {
-    // De día, las líneas N/NC no participan en la búsqueda.
-    // De noche pueden participar automáticamente junto a cualquier línea diurna
-    // que EMT siga mostrando activa en PMVVisor.
-    if (!candidate?.segments?.some(s => routeIsNightLine(s.line))) return true;
-    return routeIsNightNow(date);
+function routeServiceAllowed(candidate) {
+    // No imponemos una ventana horaria fija para las líneas N/NC.
+    // La transición entre servicio diurno y nocturno la determina PMVVisor
+    // al comprobar las próximas salidas reales de cada tramo.
+    return true;
 }
 
 function routeStopDistanceMeters(a, b) {
@@ -2702,62 +2705,66 @@ async function routeFetchPMV(stopId) {
 }
 
 async function routeApplyLiveTimes(candidates) {
-    // La ruta debe representar el estado actual de la red, no solo un cálculo
-    // teórico del CSV. Para cada tramo consultamos PMV en la parada de subida
-    // y simulamos la llegada al siguiente transbordo.
+    // Planificación dinámica: cada tramo se valida contra PMVVisor en el
+    // momento de la búsqueda. No hay una ventana artificial de 30 minutos y
+    // tampoco una hora fija para cambiar entre red diurna/nocturna.
     const stopIds=[...new Set(candidates.flatMap(c=>c.segments.map(s=>String(s.boardStop))))];
     const cache=new Map();
 
     for (const id of stopIds) {
         try { cache.set(id, await routeFetchPMV(id)); }
         catch(e){ cache.set(id,{estimaciones:[],error:e.message}); }
-        await new Promise(r=>setTimeout(r,55));
+        await new Promise(r=>setTimeout(r,45));
     }
 
-    const valid = [];
+    const valid=[];
+    const now = new Date();
+    const nowMinutes = now.getHours()*60 + now.getMinutes() + now.getSeconds()/60;
 
     for (const c of candidates) {
         let elapsed = routeWalkingMinutes(c.walkStart);
         let feasible = true;
         let firstWait = null;
+        let firstDepartureClock = null;
 
         for (let i=0; i<c.segments.length; i++) {
-            const seg = c.segments[i];
-            const data = cache.get(String(seg.boardStop));
-            const arr = (data?.estimaciones || [])
-                .filter(x => normalizeLine(x.linea) === normalizeLine(seg.line))
-                .filter(x => Number.isFinite(x.minutos));
+            const seg=c.segments[i];
+            const data=cache.get(String(seg.boardStop));
+            let arr=(data?.estimaciones||[])
+                .filter(x=>normalizeLine(x.linea)===normalizeLine(seg.line))
+                .filter(x=>Number.isFinite(x.minutos));
 
-            if (!arr.length) { feasible = false; break; }
+            // Si PMV devuelve el mismo número de línea pero varios sentidos,
+            // preferimos el que coincide con la cabecera del recorrido. Si no
+            // coincide exactamente, aceptamos la llegada porque PMV es la
+            // fuente de verdad del servicio en tiempo real.
+            if (!arr.length) { feasible=false; break; }
+            const matching=arr.filter(x=>routeMatchLiveDirection(x,seg.terminal));
+            if (matching.length) arr=matching;
 
-            // PMV expresa minutos desde este instante. Elegimos el primer bus
-            // que todavía puede alcanzarse después del tiempo acumulado.
-            const possible = arr
-                .filter(x => x.minutos + 0.25 >= elapsed)
+            // PMV da minutos relativos a AHORA. Para un transbordo futuro,
+            // elegimos el primer autobús que todavía pueda cogerse después
+            // del tiempo que llevamos acumulado.
+            const possible=arr
+                .filter(x=>x.minutos + 0.25 >= elapsed)
                 .sort((a,b)=>a.minutos-b.minutos);
+            const best=possible[0];
+            if (!best) { feasible=false; break; }
 
-            const best = possible[0];
-            if (!best) { feasible = false; break; }
-
-            const wait = Math.max(0, best.minutos - elapsed);
-            if (i === 0) {
-                firstWait = best.minutos;
-                // Si la primera salida es dentro de 30 min o más, no es una
-                // alternativa útil "ahora" para el usuario.
-                if (best.minutos >= ROUTE_LIVE_FIRST_DEPARTURE_MAX_MIN) {
-                    feasible = false;
-                    break;
-                }
+            const wait=Math.max(0,best.minutos-elapsed);
+            if (i===0) {
+                firstWait=best.minutos;
+                firstDepartureClock = nowMinutes + best.minutos;
             }
 
-            seg.live = best;
-            seg.waitMin = wait;
-            seg.liveDestination = best.destino || seg.terminal;
+            seg.live=best;
+            seg.waitMin=wait;
+            seg.liveDestination=best.destino || seg.terminal;
+            seg.liveStatus = best.minutos <= 1 ? 'ahora' : `en ${Math.round(best.minutos)} min`;
             elapsed += wait + seg.rideMin;
 
-            // Caminar al siguiente autobús después de bajarse.
-            if (i < c.segments.length - 1) {
-                const walk = (c.transferWalks || [])[i] || 0;
+            if (i<c.segments.length-1) {
+                const walk=(c.transferWalks||[])[i] || 0;
                 elapsed += routeWalkingMinutes(walk);
             }
         }
@@ -2765,9 +2772,11 @@ async function routeApplyLiveTimes(candidates) {
         if (!feasible) continue;
 
         elapsed += routeWalkingMinutes(c.walkEnd);
-        c.firstDepartureMin = firstWait;
-        c.totalMin = Math.max(1, Math.ceil(elapsed));
-        c.liveDirectionMismatch = false;
+        c.firstDepartureMin=firstWait;
+        c.firstDepartureClock=firstDepartureClock;
+        c.totalMin=Math.max(1,Math.ceil(elapsed));
+        c.liveDirectionMismatch=false;
+        c.liveCheckedAt=new Date().toISOString();
         valid.push(c);
     }
 
@@ -2836,7 +2845,7 @@ function routeResultHtml(c, index) {
     });
     if(c.walkEnd>0.01) steps+=`<div class="route-step walk"><div class="route-step-icon">🚶</div><div><div class="route-step-title">Camina ${routeFormatKm(c.walkEnd)} hasta el destino</div><div class="route-step-sub">≈ ${routeWalkingMinutes(c.walkEnd)} min a pie</div></div></div>`;
     steps+=`</div>`;
-    return `<article class="route-card"><div class="route-card-head"><div><div class="route-time-main">≈ ${c.totalMin} min</div><div class="route-time-label">tiempo total estimado desde ahora</div></div><div class="route-transfers">${c.transfers===0?'Directo':`${c.transfers} transbordo${c.transfers===1?'':'s'}`}</div></div><div class="route-meta"><span>🚶 ${routeFormatKm(totalWalk)} a pie</span><span>⏱️ ${Math.round(wait)} min de espera</span><span>🚌 ${c.segments.length} línea${c.segments.length===1?'':'s'}</span><span>🟢 salida ${c.firstDepartureMin<=0?'ahora':`en ${Math.round(c.firstDepartureMin)} min`}</span></div>${steps}</article>`;
+    return `<article class="route-card"><div class="route-card-head"><div><div class="route-time-main">≈ ${c.totalMin} min</div><div class="route-time-label">tiempo total estimado desde ahora</div></div><div class="route-transfers">${c.transfers===0?'Directo':`${c.transfers} transbordo${c.transfers===1?'':'s'}`}</div></div><div class="route-meta"><span>🚶 ${routeFormatKm(totalWalk)} a pie</span><span>⏱️ ${Math.round(wait)} min de espera</span><span>🚌 ${c.segments.length} línea${c.segments.length===1?'':'s'}</span><span class="route-step-live">🟢 primera salida ${c.firstDepartureMin<=1?'ahora':`en ${Math.round(c.firstDepartureMin)} min`}</span></div>${steps}</article>`;
 }
 async function searchRoutes() {
     const token=++routeState.routeToken;
@@ -2875,8 +2884,8 @@ async function searchRoutes() {
         candidates.sort((a,b)=>a.totalMin-b.totalMin || a.transfers-b.transfers);
         const top=candidates.slice(0,ROUTE_MAX_RESULTS);
         if(!top.length){
-            results.innerHTML='<div class="route-empty"><strong>No hay una salida EMT útil en los próximos 30 minutos.</strong><br>La aplicación no muestra rutas que obliguen a esperar media hora o más para el primer autobús.</div>';
-            $('routeResultsSummary').textContent='Sin salidas inmediatas disponibles';
+            results.innerHTML='<div class="route-empty"><strong>No hay una combinación que pueda realizarse con las salidas EMT disponibles ahora.</strong><br>La aplicación solo muestra itinerarios para los que puede confirmar una salida real en cada tramo en el momento de la consulta.</div>';
+            $('routeResultsSummary').textContent='Sin itinerarios realizables ahora';
             return;
         }
         $('routeResultsSummary').textContent=`${top.length} alternativa${top.length===1?'':'s'} disponible${top.length===1?'':'s'} ahora · ordenadas por tiempo y, a igualdad, por transbordos`;
