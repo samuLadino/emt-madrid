@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V10.1</title>
+<title>EMT Madrid · V11</title>
 
 <style>
 :root {
@@ -1118,7 +1118,11 @@ if (GOATCOUNTER_CODE) {
             <button class="small-btn" id="routeUseLocationBtn" type="button">📍 Usar mi ubicación como origen</button>
             <button class="primary" id="routeSearchBtn" type="button">Buscar rutas</button>
         </div>
-        <p class="route-note">Se muestran las alternativas que pueden realizarse con las salidas EMT disponibles en el momento de la consulta, ordenadas por tiempo total y, a igualdad de tiempo, por menos transbordos. Las correspondencias a pie se limitan a 1 km y el cambio entre servicio diurno y nocturno es automático.</p>
+        <label class="route-toggle" for="routeOnlyLive">
+            <input type="checkbox" id="routeOnlyLive">
+            <span>Mostrar solo itinerarios con la primera salida confirmada por EMT</span>
+        </label>
+        <p class="route-note">V11: el itinerario se calcula sobre toda la red EMT (algoritmo RAPTOR, hasta 5 transbordos) y los datos en tiempo real de PMVVisor solo <strong>ajustan</strong> la espera del primer tramo &mdash; ya no descartan rutas. Si no hay paradas cerca, el radio de b&uacute;squeda se ampl&iacute;a solo hasta 3&nbsp;km. Acepta direcciones, nombres de parada, n&uacute;meros de parada y coordenadas <code>40.41,-3.70</code>.</p>
         <div class="route-geocode-status" id="routeGeocodeStatus" hidden></div>
     </section>
 
@@ -1275,7 +1279,7 @@ function parseCoordinates(href) {
 
 function cleanText(value) {
     return value
-        .replace(/\\s+/g, " ")
+        .replace(/\s+/g, " ")
         .trim();
 }
 
@@ -2180,98 +2184,112 @@ $("themeBtn").addEventListener("click", () => {
 
 $("stopInput").focus();
 
-/* ===== V10 · MOTOR DE RUTAS EN TIEMPO REAL ===== */
+/* ===== V11 · MOTOR DE RUTAS (RAPTOR) =====================================
+ *
+ * CAMBIO DE FONDO RESPECTO A V10
+ * ------------------------------
+ * V10 enumeraba combinaciones (directas, 1, 2 y N transbordos) con topes
+ * duros y DESPUES exigia que TODOS los tramos tuvieran una salida real en
+ * PMVVisor. Eso hacia imposible cualquier viaje largo:
+ *
+ *   - PMVVisor solo publica las proximas llegadas (y ">60" se descarta).
+ *   - Si el 2º tramo se coge a los 30 min, nunca hay una llegada PMV que
+ *     cumpla `minutos >= 30`, asi que el itinerario se descartaba entero.
+ *   - Resultado: "No hay una combinacion que pueda realizarse ahora".
+ *
+ * V11 separa las dos cosas:
+ *
+ *   1. PLANIFICACION -> RAPTOR sobre el grafo del CSV. Es completo: si
+ *      existe un camino en la red, lo encuentra. Sin topes arbitrarios.
+ *   2. TIEMPO REAL   -> PMVVisor solo ENRIQUECE el resultado (afina la
+ *      espera del primer tramo). Nunca elimina un itinerario.
+ *
+ * Ademas: radio de busqueda progresivo, geocodificacion con reintentos y
+ * alternativas, y panel de diagnostico.
+ * ======================================================================= */
+
+const ROUTE_VERSION = 'v11';
+
 const routeState = {
     csvLoaded: false,
     csvLoading: null,
-    directions: [],
-    directionsByStop: new Map(),
+    routes: [],              // recorridos (line|sentido) con paradas ordenadas
+    routesByStop: new Map(), // paradaId -> [{routeIdx, stopIdx}]
+    footpaths: new Map(),    // paradaId -> [{to, km}]
     spatial: new Map(),
     stopById: new Map(),
     geocodeCache: new Map(),
-    routeToken: 0
+    routeToken: 0,
+    lastDiagnostics: null,
+    routeOriginCoords: null,
+    routeDestinationCoords: null
 };
 
-const ROUTE_MAX_WALK_KM = 1;
-const ROUTE_AUTO_MAX_TRANSFERS = 4;
-const ROUTE_WALK_KMH = 4.8;
-const ROUTE_BUS_KMH = 15;
-const ROUTE_MAX_ORIGIN_STOPS = 30;
-const ROUTE_MAX_DEST_STOPS = 30;
-const ROUTE_MAX_RESULTS = 8;
-const ROUTE_MAX_CANDIDATES = 60;
-// La disponibilidad diurna/nocturna no se decide por una hora fija.
-// El CSV aporta el recorrido y PMVVisor decide qué línea tiene salida REAL ahora.
-const ROUTE_LOOP_BACKTRACK_M = 160;
+/* --- Parametros del modelo ------------------------------------------- */
+const ROUTE_WALK_KMH        = 4.6;
+const ROUTE_TRANSFER_KM     = 0.45;   // radio de correspondencia a pie
+const ROUTE_TRANSFER_MAX    = 12;     // maximo de enlaces a pie por parada
+const ROUTE_ENDPOINT_RADII  = [0.8, 1.3, 2.0, 3.0];  // radio progresivo
+const ROUTE_MAX_ENDPOINT_STOPS = 80;
+const ROUTE_MAX_ROUNDS      = 6;      // hasta 5 transbordos
+const ROUTE_MAX_RESULTS     = 8;
+const ROUTE_LIVE_STOPS_MAX  = 10;     // paradas que consultamos en PMVVisor
+const ROUTE_LIVE_CONCURRENCY = 4;
+const ROUTE_TRANSFER_PENALTY = 3;     // min de penalizacion por transbordo
+const ROUTE_MIN_TRANSFER_MIN = 1;     // margen minimo al cambiar de linea
+
+const ROUTE_GEO_TTL_MS = 30 * 24 * 3600 * 1000;
+const ROUTE_GEO_STORE  = 'emt_geocode_v11';
+// Caja de Madrid capital + area EMT (lon_min, lat_min, lon_max, lat_max)
+const ROUTE_MADRID_BBOX = { minLon: -3.95, minLat: 40.28, maxLon: -3.50, maxLat: 40.58 };
+
+function routeIsNightLine(label) {
+    return /^N(C)?\d/i.test(String(label || '').trim());
+}
+function routeIsSpecialLine(label) {
+    return /^SE/i.test(String(label || '').trim());
+}
+
+/* Horquilla de servicio. No excluimos nada: solo priorizamos. */
+function routeServiceWindow(date = new Date()) {
+    const h = date.getHours() + date.getMinutes() / 60;
+    const isNight = (h >= 23.5 || h < 6);
+    return { isNight, hour: h, weekend: date.getDay() === 0 || date.getDay() === 6 };
+}
+
+/* Intervalo de paso estimado (min). Se usa para la espera cuando no hay
+ * dato en tiempo real. Es una estimacion, y se marca como tal en la UI. */
+let routeNowCtx = null;
+function routeNowContext() {
+    const now = Date.now();
+    if (!routeNowCtx || now - routeNowCtx.t > 60000) {
+        const d = new Date();
+        routeNowCtx = { t: now, w: routeServiceWindow(d) };
+    }
+    return routeNowCtx.w;
+}
+
+function routeHeadwayMin(label, when = null) {
+    const w = when ? routeServiceWindow(when) : routeNowContext();
+    if (routeIsNightLine(label)) return 30;
+    if (routeIsSpecialLine(label)) return 20;
+    if (w.weekend) return 14;
+    const peak = (w.hour >= 7 && w.hour < 10) || (w.hour >= 17 && w.hour < 20.5);
+    return peak ? 8 : 12;
+}
+const routeWaitCache = new Map();
+function routeExpectedWait(label, when = null) {
+    if (when) return Math.max(2, Math.round(routeHeadwayMin(label, when) / 2));
+    const k = String(label);
+    if (routeWaitCache.has(k)) return routeWaitCache.get(k);
+    const v = Math.max(2, Math.round(routeHeadwayMin(label) / 2));
+    routeWaitCache.set(k, v);
+    return v;
+}
 
 function routeNormalize(value) {
-    return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase().trim();
-}
-
-function routeLineKey(line, sentido) { return `${normalizeLine(line)}|${String(sentido)}`; }
-
-function routeServiceAllowed(candidate) {
-    // No imponemos una ventana horaria fija para las líneas N/NC.
-    // La transición entre servicio diurno y nocturno la determina PMVVisor
-    // al comprobar las próximas salidas reales de cada tramo.
-    return true;
-}
-
-function routeStopDistanceMeters(a, b) {
-    if (!a || !b || !Number.isFinite(a.lat) || !Number.isFinite(a.lon) || !Number.isFinite(b.lat) || !Number.isFinite(b.lon)) return Infinity;
-    return distanceKm(a.lat, a.lon, b.lat, b.lon) * 1000;
-}
-
-function routeHasBacktracking(candidate) {
-    // Evita itinerarios que avanzan por una línea y luego caminan hacia atrás
-    // hasta una parada que ya se había dejado atrás. Es el caso típico de
-    // 1145 -> 1189 -> caminar hasta 1146: parece un transbordo, pero es un rodeo.
-    for (let i = 0; i < candidate.segments.length - 1; i++) {
-        const current = candidate.segments[i];
-        const next = candidate.segments[i + 1];
-        const nextStop = routeStopInfo(next.boardStop);
-        if (!nextStop) continue;
-        const startIndex = current.boardIndex;
-        const endIndex = current.alightIndex;
-        const from = Math.max(startIndex, 0);
-        const to = Math.max(endIndex, from);
-        for (let j = from; j < to; j++) {
-            const previousStop = routeStopInfo(current.dir?.stops?.[j]?.parada || current.dir?.stops?.[j]?.parada);
-            if (!previousStop) continue;
-            if (routeStopDistanceMeters(nextStop, previousStop) <= ROUTE_LOOP_BACKTRACK_M) return true;
-        }
-    }
-    return false;
-}
-
-function routeFilterCandidates(candidates) {
-    return candidates.filter(c => routeServiceAllowed(c) && !routeHasBacktracking(c));
-}
-
-function routeCsvParse(text) {
-    const rows = [];
-    let row = [], field = "", quoted = false;
-    for (let i = 0; i < text.length; i++) {
-        const c = text[i];
-        if (quoted) {
-            if (c === '"') {
-                if (text[i + 1] === '"') { field += '"'; i++; }
-                else quoted = false;
-            } else field += c;
-        } else {
-            if (c === '"') quoted = true;
-            else if (c === ',') { row.push(field); field = ""; }
-            else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ""; }
-            else if (c !== '\r') field += c;
-        }
-    }
-    if (field.length || row.length) { row.push(field); rows.push(row); }
-    return rows;
-}
-
-function routeCsvNumber(v) {
-    const n = Number(String(v || "").replace(',', '.'));
-    return Number.isFinite(n) ? n : NaN;
+    return String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/\s+/g, ' ').toUpperCase().trim();
 }
 
 function routeStopInfo(id) {
@@ -2282,12 +2300,11 @@ function routeStopInfo(id) {
     return s || null;
 }
 
-function routeGridKey(lat, lon) {
-    return `${Math.floor(lat * 100)}:${Math.floor(lon * 100)}`;
-}
+/* ===== Indice espacial ================================================ */
+function routeGridKey(lat, lon) { return `${Math.floor(lat * 100)}:${Math.floor(lon * 100)}`; }
 
 function routeBuildSpatial() {
-    routeState.spatial.clear();
+    if (routeState.spatial.size) return;
     for (const s of STOP_DIRECTORY) {
         if (!Number.isFinite(s.lat) || !Number.isFinite(s.lon)) continue;
         const key = routeGridKey(s.lat, s.lon);
@@ -2312,56 +2329,100 @@ function routeNearbyStops(lat, lon, radiusKm = 1, limit = 20) {
             }
         }
     }
-    out.sort((a,b) => a.distanceKm - b.distanceKm);
+    out.sort((a, b) => a.distanceKm - b.distanceKm);
     const seen = new Set();
-    return out.filter(x => { const k=String(x.stop.parada); if(seen.has(k)) return false; seen.add(k); return true; }).slice(0, limit);
+    return out.filter(x => {
+        const k = String(x.stop.parada);
+        if (seen.has(k)) return false;
+        seen.add(k); return true;
+    }).slice(0, limit);
+}
+
+/* Paradas cercanas que ademas tienen servicio en el grafo. */
+function routeServedNearbyStops(lat, lon, radiusKm, limit) {
+    return routeNearbyStops(lat, lon, radiusKm, limit * 3)
+        .filter(x => routeState.routesByStop.has(String(x.stop.parada)))
+        .slice(0, limit);
+}
+
+/* ===== Carga del CSV ================================================== */
+function routeCsvParse(text) {
+    const rows = [];
+    let row = [], field = '', quoted = false;
+    for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (quoted) {
+            if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else quoted = false; }
+            else field += c;
+        } else {
+            if (c === '"') quoted = true;
+            else if (c === ',') { row.push(field); field = ''; }
+            else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+            else if (c !== '\r') field += c;
+        }
+    }
+    if (field.length || row.length) { row.push(field); rows.push(row); }
+    return rows;
+}
+
+function routeCsvNumber(v) {
+    const n = Number(String(v || '').replace(',', '.'));
+    return Number.isFinite(n) ? n : NaN;
+}
+
+function routeCsvDateKey(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    let m = raw.match(/^(\d{2})[\/-](\d{2})[\/-](\d{4})/);
+    if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+    m = raw.match(/^(\d{4})[\/-](\d{2})[\/-](\d{2})/);
+    return m ? `${m[1]}-${m[2]}-${m[3]}` : '';
 }
 
 async function routeLoadCsv() {
     if (routeState.csvLoaded) return;
     if (routeState.csvLoading) return routeState.csvLoading;
+
     routeState.csvLoading = (async () => {
         routeBuildSpatial();
+
         const response = await fetch('./stopsemt.csv', { cache: 'no-store' });
-        if (!response.ok) throw new Error(`No se pudo cargar stopsemt.csv (HTTP ${response.status})`);
+        if (!response.ok) throw new Error(`No se pudo cargar stopsemt.csv (HTTP ${response.status}). Comprueba que el archivo está junto al HTML en el repositorio.`);
         const text = await response.text();
+
         const rows = routeCsvParse(text).filter(r => r.some(v => String(v || '').trim() !== ''));
         const headers = rows.shift().map(x => x.replace(/^\uFEFF/, '').trim());
-        const idx = Object.fromEntries(headers.map((h,i) => [h,i]));
-        const groups = new Map();
+        const idx = Object.fromEntries(headers.map((h, i) => [h, i]));
 
-        // El CSV contiene recorridos con fechas de vigencia.
-        // Solo cargamos los que están activos hoy.
-        const csvDateKey = value => {
-            const raw = String(value || '').trim();
-            if (!raw) return '';
-            let m = raw.match(/^(\d{2})[\/-](\d{2})[\/-](\d{4})/);
-            if (m) return `${m[3]}-${m[2]}-${m[1]}`;
-            m = raw.match(/^(\d{4})[\/-](\d{2})[\/-](\d{2})/);
-            return m ? `${m[1]}-${m[2]}-${m[3]}` : '';
-        };
         const now = new Date();
-        const todayKey = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+        const todayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
+        // V11: la clave de agrupacion es line|sentido (codigo interno del
+        // recorrido). En V10 se agrupaba por label|sentido, y eso mezclaba
+        // dos versiones distintas del mismo recorrido (caso "SE"),
+        // produciendo una secuencia de paradas corrupta.
+        const groups = new Map();
+        let skippedByDate = 0;
 
         for (const r of rows) {
-            const dateIni = csvDateKey(r[idx.dateIni]);
-            const dateEnd = csvDateKey(r[idx.dateEnd]);
-            if (dateIni && dateIni > todayKey) continue;
-            if (dateEnd && dateEnd < todayKey) continue;
+            const dateIni = routeCsvDateKey(r[idx.dateIni]);
+            const dateEnd = routeCsvDateKey(r[idx.dateEnd]);
+            if ((dateIni && dateIni > todayKey) || (dateEnd && dateEnd < todayKey)) { skippedByDate++; continue; }
 
-            // LINE es el código interno del recorrido.
-            // LABEL es la identificación pública que debe ver el usuario.
             const routeCode = String(r[idx.line] || '').trim();
-            const label = String(r[idx.label] || '').trim();
-            const line = label || routeCode;
+            const label = String(r[idx.label] || '').trim() || routeCode;
             const sentido = String(r[idx.sentido] || '').trim();
             const parada = String(r[idx.parada] || '').trim();
-            if (!line || !sentido || !parada) continue;
+            if (!routeCode || !sentido || !parada) continue;
 
-            const key = routeLineKey(line, sentido);
+            const key = `${routeCode}|${sentido}`;
             if (!groups.has(key)) groups.set(key, {
-                line: normalizeLine(line), routeCode, sentido,
-                nameFrom: cleanText(r[idx.nameFrom] || ''), nameTo: cleanText(r[idx.nameTo] || ''),
+                key,
+                routeCode,
+                label: normalizeLine(label),
+                sentido,
+                nameFrom: cleanText(r[idx.nameFrom] || ''),
+                nameTo: cleanText(r[idx.nameTo] || ''),
                 stops: []
             });
             groups.get(key).stops.push({
@@ -2371,546 +2432,982 @@ async function routeLoadCsv() {
                 nombre: cleanText(r[idx.descparada] || '')
             });
         }
-        routeState.directions = [...groups.values()];
-        for (const d of routeState.directions) {
-            d.stops.sort((a,b) => a.seq-b.seq);
-            d.indexByStop = new Map(d.stops.map((x,i)=>[String(x.parada),i]));
-            d.terminal = d.sentido === '1' ? d.nameFrom : d.nameTo;
-            d.key = routeLineKey(d.line,d.sentido);
-            for (let i=0;i<d.stops.length;i++) {
-                const id=String(d.stops[i].parada);
-                if (!routeState.directionsByStop.has(id)) routeState.directionsByStop.set(id, []);
-                routeState.directionsByStop.get(id).push({ dir:d, index:i });
+
+        const built = [];
+        for (const g of groups.values()) {
+            g.stops.sort((a, b) => a.seq - b.seq);
+            // Eliminamos paradas repetidas dentro del mismo recorrido.
+            const seen = new Set();
+            g.stops = g.stops.filter(s => {
+                if (seen.has(s.parada)) return false;
+                seen.add(s.parada); return true;
+            });
+            if (g.stops.length < 2) continue;
+            g.terminal = g.sentido === '1' ? g.nameFrom : g.nameTo;
+            g.night = routeIsNightLine(g.label);
+            g.special = routeIsSpecialLine(g.label);
+            g.indexByStop = new Map(g.stops.map((x, i) => [String(x.parada), i]));
+            built.push(g);
+        }
+
+        routeState.routes = built;
+        routeState.routesByStop = new Map();
+        for (let ri = 0; ri < built.length; ri++) {
+            const stops = built[ri].stops;
+            for (let i = 0; i < stops.length; i++) {
+                const id = String(stops[i].parada);
+                if (!routeState.routesByStop.has(id)) routeState.routesByStop.set(id, []);
+                routeState.routesByStop.get(id).push({ routeIdx: ri, stopIdx: i });
             }
         }
+
+        routeBuildFootpaths();
+
+        routeState.csvStats = {
+            recorridos: built.length,
+            paradasConServicio: routeState.routesByStop.size,
+            filasDescartadasPorFecha: skippedByDate
+        };
         routeState.csvLoaded = true;
     })();
+
     try { await routeState.csvLoading; } finally { routeState.csvLoading = null; }
 }
 
+/* Correspondencias a pie precalculadas entre paradas con servicio. */
+function routeBuildFootpaths() {
+    routeState.footpaths = new Map();
+    for (const id of routeState.routesByStop.keys()) {
+        const s = routeStopInfo(id);
+        if (!s) continue;
+        const links = [];
+        for (const n of routeNearbyStops(s.lat, s.lon, ROUTE_TRANSFER_KM, ROUTE_TRANSFER_MAX + 4)) {
+            const to = String(n.stop.parada);
+            if (to === String(id)) continue;
+            if (!routeState.routesByStop.has(to)) continue;
+            links.push({ to, km: n.distanceKm });
+        }
+        links.sort((a, b) => a.km - b.km);
+        routeState.footpaths.set(String(id), links.slice(0, ROUTE_TRANSFER_MAX));
+    }
+}
+
+/* ===== Modelo de tiempos ============================================== */
 function routeWalkingMinutes(km) { return Math.max(1, Math.ceil(km / ROUTE_WALK_KMH * 60)); }
-function routeBusMinutes(km) { return Math.max(2, Math.ceil(km / ROUTE_BUS_KMH * 60)); }
-function routePathDistance(dir, fromIndex, toIndex) {
-    const a=dir.stops[fromIndex], b=dir.stops[toIndex];
-    if (!a || !b) return Infinity;
-    const da=Number.isFinite(a.distancia)?a.distancia:NaN, db=Number.isFinite(b.distancia)?b.distancia:NaN;
-    if (Number.isFinite(da)&&Number.isFinite(db)) return Math.abs(db-da)/1000;
-    return Math.max(0.2, Math.abs(toIndex-fromIndex)*0.25);
+function routeWalkMinutesRaw(km) { return (km / ROUTE_WALK_KMH) * 60; }
+
+function routeRouteSpeed(route) {
+    if (route._speedAt && Date.now() - route._speedAt < 60000) return route._speed;
+    const w = routeNowContext();
+    let kmh = route.night ? 22 : 14;
+    if (!route.night) {
+        const peak = (w.hour >= 7.5 && w.hour < 10) || (w.hour >= 17.5 && w.hour < 20.5);
+        if (peak && !w.weekend) kmh = 11.5;
+        else if (w.weekend) kmh = 16;
+    }
+    route._speed = kmh; route._speedAt = Date.now();
+    return kmh;
 }
 
-function routeSegment(dir, boardStop, boardIndex, alightStop, alightIndex, wait=0) {
-    const distance = routePathDistance(dir, boardIndex, alightIndex);
-    return { type:'bus', line:dir.line, sentido:dir.sentido, terminal:dir.terminal, dir, boardStop, boardIndex, alightStop, alightIndex, distanceKm:distance, rideMin:routeBusMinutes(distance), waitMin:wait, live:null };
+function routeRideMinutes(route, fromIdx, toIdx) {
+    const a = route.stops[fromIdx], b = route.stops[toIdx];
+    let km = NaN;
+    if (a && b && Number.isFinite(a.distancia) && Number.isFinite(b.distancia)) km = (b.distancia - a.distancia) / 1000;
+    if (!Number.isFinite(km) || km < 0) km = Math.max(0.25, (toIdx - fromIdx) * 0.3);
+    const kmh = routeRouteSpeed(route);
+    const stopsCount = Math.max(1, toIdx - fromIdx);
+    return Math.max(1, km / kmh * 60 + stopsCount * 0.25);
 }
 
-function routeDirectionAtStop(stopId) { return routeState.directionsByStop.get(String(stopId)) || []; }
+/* ===== RAPTOR ========================================================= */
+/*
+ * tau[k][parada] = minutos desde "ahora" al llegar a esa parada usando
+ * como maximo k trayectos en autobus. Cada ronda k explora todos los
+ * recorridos alcanzables desde las paradas marcadas en la ronda k-1.
+ *
+ * Es una busqueda COMPLETA: no hay listas truncadas ni "beam". Si existe
+ * una combinacion de <= ROUTE_MAX_ROUNDS trayectos, aparece.
+ */
+function routeRaptor(originStops, destStops, options = {}) {
+    const rounds = options.rounds || ROUTE_MAX_ROUNDS;
+    const allowed = options.allowed || null;   // Set de routeIdx permitidos
+    const routes = routeState.routes;
 
-function routeDirectCandidates(origins, destinations) {
-    const candidates=[];
-    for (const o of origins) {
-        for (const od of routeDirectionAtStop(o.stop.parada)) {
-            for (const d of destinations) {
-                const idx = od.dir.indexByStop.get(String(d.stop.parada));
-                if (idx === undefined || idx <= od.index) continue;
-                const seg=routeSegment(od.dir,o.stop.parada,od.index,d.stop.parada,idx,0);
-                candidates.push({transfers:0, walkStart:o.distanceKm, walkEnd:d.distanceKm, segments:[seg], transferWalkKm:0, transferWalks:[]});
+    // tau[k] = etiqueta MONOTONA: mejor llegada (min) usando <= k trayectos.
+    // Se copia de la ronda anterior, como en el RAPTOR original: si no se
+    // copia, se pierden puntos de subida validos y se dejan de encontrar
+    // combinaciones (uno de los fallos de fondo del motor V10).
+    const tau = [new Map()];
+    const parent = [];
+    for (let k = 0; k <= rounds; k++) parent.push(new Map());
+
+    let marked = new Set();
+    for (const o of originStops) {
+        const id = String(o.stop.parada);
+        const t = routeWalkMinutesRaw(o.distanceKm);
+        if (t < (tau[0].get(id) ?? Infinity)) {
+            tau[0].set(id, t);
+            parent[0].set(id, { type: 'start', km: o.distanceKm, stop: id });
+            marked.add(id);
+        }
+    }
+
+    const destMap = new Map(destStops.map(d => [String(d.stop.parada), d.distanceKm]));
+    const journeys = [];
+    let scannedRoutes = 0;
+
+    for (let k = 1; k <= rounds && marked.size; k++) {
+        tau[k] = new Map(tau[k - 1]);
+        const prevTau = tau[k - 1];
+        const curTau = tau[k];
+
+        // 1) Un recorrido se explora UNA vez por ronda, desde la parada
+        //    marcada mas temprana de su secuencia.
+        const queue = new Map();
+        for (const p of marked) {
+            for (const entry of (routeState.routesByStop.get(p) || [])) {
+                if (allowed && !allowed.has(entry.routeIdx)) continue;
+                const cur = queue.get(entry.routeIdx);
+                if (cur === undefined || entry.stopIdx < cur) queue.set(entry.routeIdx, entry.stopIdx);
             }
         }
-    }
-    return candidates;
-}
 
-function routeNearbyLineDirections(stopId, radiusKm=1) {
-    const s=routeStopInfo(stopId); if(!s) return [];
-    const near=routeNearbyStops(s.lat,s.lon,radiusKm,24);
-    const out=[]; const seen=new Set();
-    for(const n of near){
-        for(const x of routeDirectionAtStop(n.stop.parada)){
-            const key=x.dir.key+'|'+x.index+'|'+n.stop.parada;
-            if(seen.has(key)) continue;
-            seen.add(key); out.push({...x, transferStop:n.stop, walkKm:n.distanceKm});
-        }
-    }
-    return out;
-}
+        const newlyMarked = new Set();
 
-function routeOneTransferCandidates(origins,destinations) {
-    const candidates=[];
-    const destMap=new Set(destinations.map(x=>String(x.stop.parada)));
-    for(const o of origins){
-        const starts=routeDirectionAtStop(o.stop.parada);
-        for(const start of starts){
-            const maxIndex=Math.min(start.dir.stops.length-1,start.index+55);
-            for(let i=start.index+1;i<=maxIndex;i++){
-                const transferId=start.dir.stops[i].parada;
-                const transferStop=routeStopInfo(transferId); if(!transferStop) continue;
-                const secondOptions=routeNearbyLineDirections(transferId,ROUTE_MAX_WALK_KM);
-                for(const second of secondOptions){
-                    if(normalizeLine(second.dir.line) === normalizeLine(start.dir.line)) continue;
-                    for(const d of destinations){
-                        const idx2=second.dir.indexByStop.get(String(d.stop.parada));
-                        if(idx2===undefined || idx2<=second.index) continue;
-                        const firstSeg=routeSegment(start.dir,o.stop.parada,start.index,transferId,i,0);
-                        const secondSeg=routeSegment(second.dir,second.transferStop.parada,second.index,d.stop.parada,idx2,0);
-                        candidates.push({transfers:1,walkStart:o.distanceKm,walkEnd:d.distanceKm,segments:[firstSeg,secondSeg],transferWalkKm:second.walkKm,transferWalks:[second.walkKm]});
+        for (const [ri, startIdx] of queue) {
+            scannedRoutes++;
+            const route = routes[ri];
+            const stops = route.stops;
+            const wait = routeExpectedWait(route.label);
+            let boardStop = null, boardIdx = -1, boardTime = Infinity;
+
+            for (let i = startIdx; i < stops.length; i++) {
+                const p = String(stops[i].parada);
+                let curArrival = Infinity;
+
+                if (boardStop !== null) {
+                    curArrival = boardTime + routeRideMinutes(route, boardIdx, i);
+                    if (curArrival < (curTau.get(p) ?? Infinity) - 0.01) {
+                        curTau.set(p, curArrival);
+                        parent[k].set(p, { type: 'bus', routeIdx: ri, boardIdx, boardStop, alightIdx: i });
+                        newlyMarked.add(p);
+                    }
+                }
+
+                // Subir aqui solo si asi salimos ANTES que continuando a bordo.
+                const prev = prevTau.get(p);
+                if (prev !== undefined) {
+                    const departure = prev + wait + (k > 1 ? ROUTE_MIN_TRANSFER_MIN : 0);
+                    if (departure < curArrival - 0.01) {
+                        boardStop = p; boardIdx = i; boardTime = departure;
                     }
                 }
             }
         }
-    }
-    return candidates;
-}
 
-function routeTwoTransferCandidates(origins,destinations) {
-    const out=[]; const seen=new Set();
-    const firsts=[];
-    for(const o of origins){
-        for(const start of routeDirectionAtStop(o.stop.parada)){
-            const max=Math.min(start.dir.stops.length-1,start.index+45);
-            for(let i=start.index+1;i<=max;i++){
-                const sid=start.dir.stops[i].parada;
-                const s=routeStopInfo(sid); if(!s) continue;
-                const secondOptions=routeNearbyLineDirections(sid,ROUTE_MAX_WALK_KM).filter(x=>normalizeLine(x.dir.line)!==normalizeLine(start.dir.line)).slice(0,18);
-                for(const second of secondOptions){
-                    firsts.push({o,start,i,sid,second});
-                    if(firsts.length>70) break;
-                }
-                if(firsts.length>70) break;
-            }
-            if(firsts.length>70) break;
-        }
-        if(firsts.length>70) break;
-    }
-    for(const f of firsts){
-        const second=f.second;
-        const max=Math.min(second.dir.stops.length-1,second.index+35);
-        for(let j=second.index+1;j<=max;j++){
-            const sid2=second.dir.stops[j].parada;
-            const s2=routeStopInfo(sid2); if(!s2) continue;
-            const thirdOptions=routeNearbyLineDirections(sid2,ROUTE_MAX_WALK_KM).filter(x=>normalizeLine(x.dir.line)!==normalizeLine(f.start.dir.line) && normalizeLine(x.dir.line)!==normalizeLine(second.dir.line)).slice(0,14);
-            for(const third of thirdOptions){
-                for(const d of destinations){
-                    const idx3=third.dir.indexByStop.get(String(d.stop.parada));
-                    if(idx3===undefined || idx3<=third.index) continue;
-                    const sig=[f.start.dir.key,f.sid,second.dir.key,sid2,third.dir.key,d.stop.parada].join('|');
-                    if(seen.has(sig)) continue; seen.add(sig);
-                    out.push({
-                        transfers:2,walkStart:f.o.distanceKm,walkEnd:d.distanceKm,
-                        segments:[
-                            routeSegment(f.start.dir,f.o.stop.parada,f.start.index,f.sid,f.i,0),
-                            routeSegment(second.dir,second.transferStop.parada,second.index,sid2,j,0),
-                            routeSegment(third.dir,third.transferStop.parada,third.index,d.stop.parada,idx3,0)
-                        ],
-                        transferWalkKm:f.second.walkKm+third.walkKm, transferWalks:[f.second.walkKm,third.walkKm]
-                    });
+        // 2) Correspondencias a pie.
+        const footQueue = [...newlyMarked];
+        for (const p of footQueue) {
+            const base = curTau.get(p);
+            if (base === undefined) continue;
+            for (const link of (routeState.footpaths.get(p) || [])) {
+                const t = base + routeWalkMinutesRaw(link.km);
+                if (t < (curTau.get(link.to) ?? Infinity) - 0.01) {
+                    curTau.set(link.to, t);
+                    parent[k].set(link.to, { type: 'foot', from: p, km: link.km });
+                    newlyMarked.add(link.to);
                 }
             }
         }
+
+        marked = newlyMarked;
+
+        // 3) Mejores llegadas al destino con <= k trayectos. Guardamos varias
+        //    paradas de bajada distintas para dar variedad de alternativas.
+        const arrivals = [];
+        for (const [p, walkKm] of destMap) {
+            const t = curTau.get(p);
+            if (t === undefined) continue;
+            arrivals.push({ total: t + routeWalkMinutesRaw(walkKm), stop: p, round: k, walkKm });
+        }
+        // Varias paradas de bajada distintas pueden reconstruir el MISMO
+        // itinerario (se llega a todas caminando desde la misma parada).
+        // Recorremos la lista hasta juntar cadenas de lineas distintas.
+        arrivals.sort((a, b) => a.total - b.total);
+        const seenChains = new Set();
+        let kept = 0;
+        for (const a of arrivals) {
+            if (kept >= 3) break;
+            const j = routeBuildJourney(a, parent, rounds);
+            if (!j) continue;
+            const chain = routeJourneyKey(j);
+            if (seenChains.has(chain)) continue;
+            seenChains.add(chain);
+            journeys.push(j);
+            kept++;
+        }
     }
-    return out;
+
+    return { journeys, scannedRoutes };
 }
 
+/* Reconstruye el itinerario siguiendo los punteros de RAPTOR. */
+function routeBuildJourney(arrival, parent, rounds) {
+    const legs = [];
+    let cur = String(arrival.stop);
+    let k = arrival.round;
+    let guard = 0;
 
-function routeMultiTransferCandidates(origins, destinations, maxTransfers) {
-    if (maxTransfers <= 2) return [];
+    while (guard++ < 80) {
+        // tau[k] es monotona, asi que el puntero puede estar en una ronda
+        // anterior. Retrocedemos hasta encontrarlo.
+        while (k > 0 && !parent[k].has(cur)) k--;
+        const node = parent[k].get(cur);
+        if (!node) return null;
 
-    // V9.7: búsqueda guiada por destino. La V9.7 era demasiado conservadora:
-    // limitaba demasiado el avance de cada línea y podía descartar la cadena
-    // correcta antes de llegar a una zona de intercambio útil.
-    //
-    // No hacemos una expansión combinatoria completa. En cada nivel conservamos
-    // estados prometedores según distancia al destino + coste acumulado y
-    // eliminamos estados dominados. Además cedemos el hilo periódicamente.
-    const MAX_STATES_PER_LEVEL = 220;
-    const MAX_TRANSFER_OPTIONS = 16;
-    const MAX_STOPS_FORWARD = 80;
-    const MAX_RESULTS_INTERNAL = 100;
-    const transferCache = new Map();
-    const out = [];
-    const seenResults = new Set();
+        if (node.type === 'start') { legs.push({ type: 'start', km: node.km, stop: cur }); break; }
 
-    const destinationPoints = destinations.map(x => ({lat:x.stop.lat, lon:x.stop.lon}));
-    function distanceToDestination(stop) {
-        if (!stop || !destinationPoints.length) return 99;
-        let best = Infinity;
-        for (const d of destinationPoints) {
-            if (!Number.isFinite(d.lat) || !Number.isFinite(d.lon)) continue;
-            best = Math.min(best, distanceKm(stop.lat, stop.lon, d.lat, d.lon));
+        if (node.type === 'foot') {
+            legs.push({ type: 'foot', km: node.km, from: node.from, to: cur });
+            cur = String(node.from);
+            continue;
         }
-        return Number.isFinite(best) ? best : 99;
-    }
 
-    function getTransferOptions(stopId) {
-        const key = String(stopId);
-        if (transferCache.has(key)) return transferCache.get(key);
-        const options = routeNearbyLineDirections(key, ROUTE_MAX_WALK_KM)
-            .filter(x => x && x.dir && x.transferStop)
-            .sort((a,b) => a.walkKm - b.walkKm)
-            .slice(0, MAX_TRANSFER_OPTIONS);
-        transferCache.set(key, options);
-        return options;
-    }
-
-    function stateCost(state) {
-        const ride = state.segments.reduce((sum,s) => sum + s.rideMin, 0);
-        const walk = routeWalkingMinutes(state.origin.distanceKm + state.transferWalkKm);
-        const current = routeStopInfo(state.currentStop);
-        const toTarget = distanceToDestination(current);
-        // El término de distancia evita que el beam conserve recorridos que
-        // se alejan demasiado del destino solo porque tienen pocos minutos.
-        return ride + walk + state.transfers * 4 + toTarget * 7;
-    }
-
-    function stateSignature(state) {
-        return `${state.dir.key}|${state.index}|${state.currentStop}|${state.transfers}`;
-    }
-
-    let frontier = [];
-    for (const o of origins) {
-        for (const start of routeDirectionAtStop(o.stop.parada)) {
-            frontier.push({
-                origin:o,
-                segments:[],
-                dir:start.dir,
-                index:start.index,
-                currentStop:String(o.stop.parada),
-                transferWalks:[],
-                transferWalkKm:0,
-                transfers:0,
-                pathStops:[String(o.stop.parada)],
-                pathDirs:[start.dir.key]
+        if (node.type === 'bus') {
+            const route = routeState.routes[node.routeIdx];
+            legs.push({
+                type: 'bus',
+                routeIdx: node.routeIdx,
+                route,
+                line: route.label,
+                sentido: route.sentido,
+                terminal: route.terminal,
+                boardStop: String(node.boardStop),
+                boardIdx: node.boardIdx,
+                alightStop: cur,
+                alightIdx: node.alightIdx,
+                rideMin: routeRideMinutes(route, node.boardIdx, node.alightIdx),
+                waitMin: routeExpectedWait(route.label),
+                waitEstimated: true,
+                live: null
             });
+            cur = String(node.boardStop);
+            k -= 1;
+            if (k < 0) return null;
+            continue;
         }
+        return null;
     }
 
-    // Estados iniciales únicos.
-    const initialSeen = new Set();
-    frontier = frontier.filter(s => {
-        const k=`${s.dir.key}|${s.index}|${s.currentStop}`;
-        if(initialSeen.has(k)) return false;
-        initialSeen.add(k); return true;
-    });
+    legs.reverse();
+    const buses = legs.filter(l => l.type === 'bus');
+    if (!buses.length) return null;
 
-    for(let depth=0; depth<maxTransfers && frontier.length; depth++) {
-        frontier.sort((a,b)=>stateCost(a)-stateCost(b));
-        frontier=frontier.slice(0,MAX_STATES_PER_LEVEL);
-        const nextStates=[];
-        const levelSeen=new Set();
-        let work=0;
-
-        for(const state of frontier) {
-            const end=Math.min(state.dir.stops.length-1,state.index+MAX_STOPS_FORWARD);
-
-            for(let i=state.index+1;i<=end;i++) {
-                work++;
-                const sid=String(state.dir.stops[i].parada);
-                if(state.pathStops.includes(sid)) continue;
-                const transferStop=routeStopInfo(sid);
-                if(!transferStop) continue;
-
-                // Primero comprobamos si esta línea puede llegar directamente
-                // a cualquiera de las paradas candidatas de destino.
-                for(const d of destinations) {
-                    const idxDest=state.dir.indexByStop.get(String(d.stop.parada));
-                    if(idxDest===undefined || idxDest<=i) continue;
-                    const finalSeg=routeSegment(state.dir,state.currentStop,state.index,d.stop.parada,idxDest,0);
-                    const candidate={
-                        transfers:state.transfers,
-                        walkStart:state.origin.distanceKm,
-                        walkEnd:d.distanceKm,
-                        segments:state.segments.concat(finalSeg),
-                        transferWalkKm:state.transferWalkKm,
-                        transferWalks:state.transferWalks.slice()
-                    };
-                    const sig=candidate.segments.map(x=>`${x.line}|${x.sentido}|${x.boardStop}|${x.alightStop}`).join('>');
-                    if(!seenResults.has(sig)) { seenResults.add(sig); out.push(candidate); }
-                }
-
-                if(state.transfers+1>maxTransfers) continue;
-
-                const options=getTransferOptions(sid);
-                for(const next of options) {
-                    const nextLine=normalizeLine(next.dir.line);
-                    const currentLine=normalizeLine(state.dir.line);
-                    if(nextLine===currentLine) continue;
-                    if(next.dir.key===state.dir.key && String(next.transferStop.parada)===sid) continue;
-                    if(state.pathDirs.includes(next.dir.key)) continue;
-                    if(state.pathStops.includes(String(next.transferStop.parada))) continue;
-                    if(next.index>=next.dir.stops.length-1) continue;
-
-                    const segment=routeSegment(state.dir,state.currentStop,state.index,sid,i,0);
-                    const ns={
-                        origin:state.origin,
-                        segments:state.segments.concat(segment),
-                        dir:next.dir,
-                        index:next.index,
-                        currentStop:String(next.transferStop.parada),
-                        transferWalks:state.transferWalks.concat(next.walkKm),
-                        transferWalkKm:state.transferWalkKm+next.walkKm,
-                        transfers:state.transfers+1,
-                        pathStops:state.pathStops.concat(sid),
-                        pathDirs:state.pathDirs.concat(next.dir.key)
-                    };
-                    const key=stateSignature(ns);
-                    if(levelSeen.has(key)) continue;
-                    levelSeen.add(key);
-                    nextStates.push(ns);
-                }
-
-                // No bloqueamos el navegador durante miles de iteraciones.
-                // El resto de la función continúa síncronamente, pero el beam
-                // pequeño evita la explosión combinatoria.
-                if(out.length>=MAX_RESULTS_INTERNAL) break;
-            }
-            if(out.length>=MAX_RESULTS_INTERNAL) break;
-        }
-
-        if(out.length>=MAX_RESULTS_INTERNAL) break;
-        nextStates.sort((a,b)=>stateCost(a)-stateCost(b));
-        frontier=nextStates.slice(0,MAX_STATES_PER_LEVEL);
+    const startLeg = legs.find(l => l.type === 'start');
+    const walkStart = startLeg ? startLeg.km : 0;
+    const transferWalks = [];
+    for (let i = 0; i < buses.length - 1; i++) {
+        const a = legs.indexOf(buses[i]), b = legs.indexOf(buses[i + 1]);
+        let km = 0;
+        for (let n = a + 1; n < b; n++) if (legs[n].type === 'foot') km += legs[n].km;
+        transferWalks.push(km);
     }
 
-    return out.slice(0,MAX_RESULTS_INTERNAL);
+    const total = arrival.total;
+    return {
+        legs,
+        segments: buses,
+        transfers: buses.length - 1,
+        walkStart,
+        walkEnd: arrival.walkKm,
+        transferWalkKm: transferWalks.reduce((a, b) => a + b, 0),
+        transferWalks,
+        estimatedMin: Math.max(1, Math.ceil(total)),
+        totalMin: Math.max(1, Math.ceil(total)),
+        firstDepartureMin: buses[0].waitMin,
+        round: arrival.round,
+        hasNight: buses.some(b => b.route.night),
+        hasSpecial: buses.some(b => b.route.special),
+        liveConfirmed: false
+    };
 }
 
-function routeDeduplicate(candidates) {
-    const map=new Map();
-    for(const c of candidates){
-        const key=c.segments.map(s=>`${s.line}|${s.sentido}|${s.boardStop}|${s.alightStop}`).join('>');
-        if(!map.has(key)) map.set(key,c);
+function routeJourneyKey(j) {
+    return j.segments.map(s => `${s.line}|${s.sentido}|${s.boardStop}|${s.alightStop}`).join('>');
+}
+
+function routeLineChain(j) {
+    return j.segments.map(s => normalizeLine(s.line)).join('>');
+}
+
+/* Dos itinerarios con las mismas lineas y distinta parada de bajada son la
+ * misma opcion para el usuario. Conservamos solo el mas rapido de cada
+ * cadena de lineas y, si quedan huecos, rellenamos con variantes. */
+function routeCollapseByLines(list) {
+    const best = new Map();
+    for (const j of list) {
+        const k = routeLineChain(j);
+        const prev = best.get(k);
+        if (!prev || j.totalMin < prev.totalMin) best.set(k, j);
+    }
+    return [...best.values()];
+}
+
+function routeDeduplicate(list) {
+    const map = new Map();
+    for (const j of list) {
+        const k = routeJourneyKey(j);
+        const prev = map.get(k);
+        if (!prev || j.totalMin < prev.totalMin) map.set(k, j);
     }
     return [...map.values()];
 }
 
-function routeScore(c) {
-    const ride=c.segments.reduce((a,s)=>a+s.rideMin,0);
-    const walk=routeWalkingMinutes(c.walkStart+c.walkEnd+c.transferWalkKm);
-    const waits=c.segments.reduce((a,s)=>a+(s.waitMin||0),0);
-    return walk+ride+waits+c.transfers*2;
+/* Conserva el frente de Pareto (tiempo vs transbordos) y algo de variedad. */
+function routeParetoFilter(list) {
+    const sorted = [...list].sort((a, b) => a.totalMin - b.totalMin || a.transfers - b.transfers);
+    const out = [];
+    let bestTransfers = Infinity;
+    for (const j of sorted) {
+        if (j.transfers < bestTransfers) { out.push(j); bestTransfers = j.transfers; }
+        else if (out.length < 3) out.push(j);
+    }
+    // Rellenamos con las siguientes mas rapidas hasta el limite.
+    for (const j of sorted) {
+        if (out.length >= ROUTE_MAX_RESULTS) break;
+        if (!out.includes(j)) out.push(j);
+    }
+    return out.sort((a, b) => a.totalMin - b.totalMin || a.transfers - b.transfers)
+        .slice(0, ROUTE_MAX_RESULTS);
 }
 
-function routeMatchLiveDirection(item, plannedTerminal) {
-    const live=routeNormalize(item?.destino || '');
-    const planned=routeNormalize(plannedTerminal || '');
-    if(!live || !planned) return true;
-    const words=planned.split(/\s+/).filter(w=>w.length>3);
-    return words.length ? words.some(w=>live.includes(w)) : true;
-}
-
+/* ===== Tiempo real (solo enriquece) =================================== */
 async function routeFetchPMV(stopId) {
-    const url=`https://www.emtmadrid.es/PMVVisor/pmv.aspx?stopnum=${encodeURIComponent(stopId)}&size=10`;
-    const response=await fetch(url,{method:'GET',mode:'cors',cache:'no-store'});
-    if(!response.ok) throw new Error(`HTTP ${response.status}`);
+    const url = `https://www.emtmadrid.es/PMVVisor/pmv.aspx?stopnum=${encodeURIComponent(stopId)}&size=20`;
+    const response = await fetch(url, { method: 'GET', mode: 'cors', cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return parsePMV(await response.text());
 }
 
-async function routeApplyLiveTimes(candidates) {
-    // Planificación dinámica: cada tramo se valida contra PMVVisor en el
-    // momento de la búsqueda. No hay una ventana artificial de 30 minutos y
-    // tampoco una hora fija para cambiar entre red diurna/nocturna.
-    const stopIds=[...new Set(candidates.flatMap(c=>c.segments.map(s=>String(s.boardStop))))];
-    const cache=new Map();
-
-    for (const id of stopIds) {
-        try { cache.set(id, await routeFetchPMV(id)); }
-        catch(e){ cache.set(id,{estimaciones:[],error:e.message}); }
-        await new Promise(r=>setTimeout(r,45));
-    }
-
-    const valid=[];
-    const now = new Date();
-    const nowMinutes = now.getHours()*60 + now.getMinutes() + now.getSeconds()/60;
-
-    for (const c of candidates) {
-        let elapsed = routeWalkingMinutes(c.walkStart);
-        let feasible = true;
-        let firstWait = null;
-        let firstDepartureClock = null;
-
-        for (let i=0; i<c.segments.length; i++) {
-            const seg=c.segments[i];
-            const data=cache.get(String(seg.boardStop));
-            let arr=(data?.estimaciones||[])
-                .filter(x=>normalizeLine(x.linea)===normalizeLine(seg.line))
-                .filter(x=>Number.isFinite(x.minutos));
-
-            // Si PMV devuelve el mismo número de línea pero varios sentidos,
-            // preferimos el que coincide con la cabecera del recorrido. Si no
-            // coincide exactamente, aceptamos la llegada porque PMV es la
-            // fuente de verdad del servicio en tiempo real.
-            if (!arr.length) { feasible=false; break; }
-            const matching=arr.filter(x=>routeMatchLiveDirection(x,seg.terminal));
-            if (matching.length) arr=matching;
-
-            // PMV da minutos relativos a AHORA. Para un transbordo futuro,
-            // elegimos el primer autobús que todavía pueda cogerse después
-            // del tiempo que llevamos acumulado.
-            const possible=arr
-                .filter(x=>x.minutos + 0.25 >= elapsed)
-                .sort((a,b)=>a.minutos-b.minutos);
-            const best=possible[0];
-            if (!best) { feasible=false; break; }
-
-            const wait=Math.max(0,best.minutos-elapsed);
-            if (i===0) {
-                firstWait=best.minutos;
-                firstDepartureClock = nowMinutes + best.minutos;
-            }
-
-            seg.live=best;
-            seg.waitMin=wait;
-            seg.liveDestination=best.destino || seg.terminal;
-            seg.liveStatus = best.minutos <= 1 ? 'ahora' : `en ${Math.round(best.minutos)} min`;
-            elapsed += wait + seg.rideMin;
-
-            if (i<c.segments.length-1) {
-                const walk=(c.transferWalks||[])[i] || 0;
-                elapsed += routeWalkingMinutes(walk);
-            }
-        }
-
-        if (!feasible) continue;
-
-        elapsed += routeWalkingMinutes(c.walkEnd);
-        c.firstDepartureMin=firstWait;
-        c.firstDepartureClock=firstDepartureClock;
-        c.totalMin=Math.max(1,Math.ceil(elapsed));
-        c.liveDirectionMismatch=false;
-        c.liveCheckedAt=new Date().toISOString();
-        valid.push(c);
-    }
-
-    return valid;
+function routeMatchLiveDirection(item, plannedTerminal) {
+    const live = routeNormalize(item?.destino || '');
+    const planned = routeNormalize(plannedTerminal || '');
+    if (!live || !planned) return true;
+    const words = planned.split(/\s+/).filter(w => w.length > 3);
+    return words.length ? words.some(w => live.includes(w)) : true;
 }
-async function routeGeocode(input) {
-    const raw=String(input||'').trim();
-    const stopMatch=raw.match(/^(?:parada\s*)?(\d{1,5})$/i);
-    if(stopMatch){
-        const s=routeStopInfo(stopMatch[1]);
-        if(s) return {lat:s.lat,lon:s.lon,label:`Parada ${s.parada} · ${s.nombre}`,stop:s};
+
+async function routeMapLimit(items, limit, worker) {
+    const results = new Array(items.length);
+    let cursor = 0;
+    const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+        while (cursor < items.length) {
+            const i = cursor++;
+            try { results[i] = await worker(items[i]); }
+            catch (e) { results[i] = { error: e.message }; }
+        }
+    });
+    await Promise.all(runners);
+    return results;
+}
+
+/*
+ * V11: PMVVisor ya NO decide si un itinerario existe. Solo se usa para
+ * sustituir la espera estimada del primer tramo (y del segundo si el
+ * enlace es inminente) por el dato real. Si no hay dato, el itinerario se
+ * muestra igualmente marcado como estimado.
+ */
+async function routeEnrichWithLive(journeys, diagnostics) {
+    const wanted = [];
+    for (const j of journeys) {
+        const first = j.segments[0];
+        if (first) wanted.push(String(first.boardStop));
     }
-    const key=routeNormalize(raw);
-    if(routeState.geocodeCache.has(key)) return routeState.geocodeCache.get(key);
-    const url=`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=es&accept-language=es&q=${encodeURIComponent(raw+', Madrid')}`;
-    const response=await fetch(url,{headers:{'Accept':'application/json'},cache:'no-store'});
-    if(!response.ok) throw new Error('No se ha podido localizar la dirección.');
-    const data=await response.json();
-    if(!data.length) throw new Error(`No se ha encontrado «${raw}».`);
-    const result={lat:Number(data[0].lat),lon:Number(data[0].lon),label:data[0].display_name,stop:null};
-    routeState.geocodeCache.set(key,result);
-    return result;
+    const stopIds = [...new Set(wanted)].slice(0, ROUTE_LIVE_STOPS_MAX);
+    if (!stopIds.length) return journeys;
+
+    const fetched = await routeMapLimit(stopIds, ROUTE_LIVE_CONCURRENCY, async id => ({ id, data: await routeFetchPMV(id) }));
+    const cache = new Map();
+    let ok = 0, failed = 0;
+    for (const r of fetched) {
+        if (r && r.data) { cache.set(String(r.id), r.data); ok++; }
+        else failed++;
+    }
+    diagnostics.pmv = { consultadas: stopIds.length, correctas: ok, fallidas: failed };
+
+    for (const j of journeys) {
+        const seg = j.segments[0];
+        if (!seg) continue;
+        const data = cache.get(String(seg.boardStop));
+        if (!data) continue;
+
+        let arr = (data.estimaciones || [])
+            .filter(x => normalizeLine(x.linea) === normalizeLine(seg.line))
+            .filter(x => Number.isFinite(x.minutos));
+        if (!arr.length) {
+            // La linea existe en el CSV pero PMV no la anuncia ahora: puede
+            // estar fuera de servicio. Lo indicamos, pero NO borramos la ruta.
+            seg.liveStatus = 'sin-dato';
+            continue;
+        }
+        const matching = arr.filter(x => routeMatchLiveDirection(x, seg.terminal));
+        if (matching.length) arr = matching;
+
+        const walkToStop = routeWalkMinutesRaw(j.walkStart);
+        const catchable = arr.filter(x => x.minutos + 0.5 >= walkToStop).sort((a, b) => a.minutos - b.minutos);
+        const best = catchable[0] || arr.sort((a, b) => a.minutos - b.minutos)[0];
+        if (!best) continue;
+
+        const realWait = Math.max(0, best.minutos - walkToStop);
+        const delta = realWait - seg.waitMin;
+        seg.live = best;
+        seg.waitMin = realWait;
+        seg.waitEstimated = false;
+        seg.liveDestination = best.destino || seg.terminal;
+        seg.liveStatus = 'ok';
+        j.firstDepartureMin = best.minutos;
+        j.liveConfirmed = true;
+        j.totalMin = Math.max(1, Math.ceil(j.estimatedMin + delta));
+    }
+    return journeys;
+}
+
+/* ===== Geocodificacion robusta ======================================== */
+function routeGeoStoreLoad() {
+    try {
+        const raw = localStorage.getItem(ROUTE_GEO_STORE);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        const now = Date.now();
+        for (const k of Object.keys(parsed)) if (!parsed[k] || now - parsed[k].t > ROUTE_GEO_TTL_MS) delete parsed[k];
+        return parsed;
+    } catch { return {}; }
+}
+function routeGeoStoreSave(key, value) {
+    try {
+        const store = routeGeoStoreLoad();
+        store[key] = { t: Date.now(), v: value };
+        localStorage.setItem(ROUTE_GEO_STORE, JSON.stringify(store));
+    } catch { /* cuota llena o modo privado: no es critico */ }
+}
+
+function routeInMadrid(lat, lon) {
+    return lat >= ROUTE_MADRID_BBOX.minLat && lat <= ROUTE_MADRID_BBOX.maxLat
+        && lon >= ROUTE_MADRID_BBOX.minLon && lon <= ROUTE_MADRID_BBOX.maxLon;
+}
+
+let routeGeoLastCall = 0;
+async function routeThrottleGeo(minGapMs = 1100) {
+    const wait = routeGeoLastCall + minGapMs - Date.now();
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    routeGeoLastCall = Date.now();
+}
+
+async function routeTryNominatim(query) {
+    await routeThrottleGeo();
+    const vb = `${ROUTE_MADRID_BBOX.minLon},${ROUTE_MADRID_BBOX.maxLat},${ROUTE_MADRID_BBOX.maxLon},${ROUTE_MADRID_BBOX.minLat}`;
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&countrycodes=es&accept-language=es`
+        + `&viewbox=${vb}&bounded=1&q=${encodeURIComponent(query)}`;
+    const res = await fetch(url, { headers: { 'Accept': 'application/json' }, cache: 'no-store' });
+    if (!res.ok) throw new Error(`Nominatim HTTP ${res.status}`);
+    const data = await res.json();
+    for (const item of data) {
+        const lat = Number(item.lat), lon = Number(item.lon);
+        if (routeInMadrid(lat, lon)) return { lat, lon, label: item.display_name, source: 'nominatim' };
+    }
+    return null;
+}
+
+async function routeTryPhoton(query) {
+    const url = `https://photon.komoot.io/api/?limit=5&lang=es&lat=40.4168&lon=-3.7038&q=${encodeURIComponent(query)}`;
+    const res = await fetch(url, { headers: { 'Accept': 'application/json' }, cache: 'no-store' });
+    if (!res.ok) throw new Error(`Photon HTTP ${res.status}`);
+    const data = await res.json();
+    for (const f of (data.features || [])) {
+        const [lon, lat] = f.geometry?.coordinates || [];
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+        if (!routeInMadrid(lat, lon)) continue;
+        const p = f.properties || {};
+        const label = [p.name, p.housenumber, p.street, p.district, p.city].filter(Boolean).join(', ');
+        return { lat, lon, label: label || 'Resultado Photon', source: 'photon' };
+    }
+    return null;
+}
+
+/*
+ * Ultimo recurso sin red: busca la calle en las direcciones de las propias
+ * paradas EMT. No es exacto al numero de portal, pero situa el punto en la
+ * calle correcta, que es suficiente para planificar.
+ */
+function routeLocalStreetMatch(query) {
+    const q = routeNormalize(query)
+        .replace(/^(CALLE|C\/|C\.|AVENIDA|AVDA|AV\.?|PASEO|PSO|PZA\.?|PLAZA|GLORIETA|GTA\.?|RONDA|CAMINO|CTRA|CARRETERA|TRAVESIA)\s+/, '');
+    const numberMatch = q.match(/\b(\d{1,4})\b\s*$/);
+    const street = (numberMatch ? q.slice(0, numberMatch.index) : q).replace(/[,\s]+$/, '').trim();
+    if (street.length < 5) return null;
+
+    const scored = [];
+    for (const s of STOP_DIRECTORY) {
+        const dir = routeNormalize(s.direccion || '');
+        const nom = routeNormalize(s.nombre || '');
+        // Solo aceptamos coincidencias fuertes: la direccion EMPIEZA por la
+        // calle, o el nombre de la parada la contiene como componente. Asi
+        // evitamos falsos positivos del tipo "DEL AIRE" dentro de
+        // "EJERCITO DEL AIRE".
+        let score = 0;
+        if (dir.startsWith(street)) score = 4;
+        else if (nom.split(/[-·\/]/).some(part => part.trim() === street)) score = 3;
+        else continue;
+
+        if (numberMatch) {
+            const m = dir.match(/\b(\d{1,4})\b/);
+            if (m) score += Math.max(0, 2 - Math.abs(Number(m[1]) - Number(numberMatch[1])) / 60);
+        }
+        scored.push({ s, score });
+    }
+    if (!scored.length) return null;
+
+    scored.sort((a, b) => b.score - a.score);
+    const top = scored.slice(0, 3);
+    const lat = top.reduce((a, x) => a + x.s.lat, 0) / top.length;
+    const lon = top.reduce((a, x) => a + x.s.lon, 0) / top.length;
+    return {
+        lat, lon,
+        label: `Aproximado por calle · cerca de «${top[0].s.direccion || top[0].s.nombre}»`,
+        source: 'aproximado',
+        approximate: true
+    };
+}
+
+async function routeGeocode(input) {
+    const raw = String(input || '').trim();
+    if (!raw) throw new Error('Falta el texto a localizar.');
+
+    // 1. Coordenadas directas "40.41,-3.70"
+    const coord = raw.match(/^\s*(-?\d{1,3}(?:[.,]\d+)?)\s*,\s*(-?\d{1,3}(?:[.,]\d+)?)\s*$/);
+    if (coord) {
+        const lat = Number(coord[1].replace(',', '.')), lon = Number(coord[2].replace(',', '.'));
+        if (Number.isFinite(lat) && Number.isFinite(lon)) return { lat, lon, label: `Coordenadas ${lat.toFixed(5)}, ${lon.toFixed(5)}`, source: 'coords' };
+    }
+
+    // 2. Numero de parada
+    const stopMatch = raw.match(/^(?:parada\s*)?(\d{1,5})$/i);
+    if (stopMatch) {
+        const s = routeStopInfo(stopMatch[1]);
+        if (s) return { lat: s.lat, lon: s.lon, label: `Parada ${s.parada} · ${s.nombre}`, stop: s, source: 'parada' };
+    }
+
+    // 3. Nombre exacto de parada del directorio
+    const nameHit = STOP_DIRECTORY.find(s => routeNormalize(s.nombre) === routeNormalize(raw));
+    if (nameHit) return { lat: nameHit.lat, lon: nameHit.lon, label: `Parada ${nameHit.parada} · ${nameHit.nombre}`, stop: nameHit, source: 'parada' };
+
+    // 4. Cache
+    const key = routeNormalize(raw);
+    if (routeState.geocodeCache.has(key)) return routeState.geocodeCache.get(key);
+    const stored = routeGeoStoreLoad()[key];
+    if (stored?.v) { routeState.geocodeCache.set(key, stored.v); return stored.v; }
+
+    // 5. Proveedores externos, con varias formulaciones de la consulta.
+    const variants = [
+        `${raw}, Madrid, España`,
+        `${raw}, Madrid`,
+        raw
+    ];
+    const errors = [];
+
+    for (const q of variants) {
+        try {
+            const r = await routeTryNominatim(q);
+            if (r) { routeState.geocodeCache.set(key, r); routeGeoStoreSave(key, r); return r; }
+        } catch (e) { errors.push(`Nominatim: ${e.message}`); }
+    }
+    for (const q of variants.slice(0, 2)) {
+        try {
+            const r = await routeTryPhoton(q);
+            if (r) { routeState.geocodeCache.set(key, r); routeGeoStoreSave(key, r); return r; }
+        } catch (e) { errors.push(`Photon: ${e.message}`); }
+    }
+
+    // 6. Ultimo recurso offline.
+    const local = routeLocalStreetMatch(raw);
+    if (local) { routeState.geocodeCache.set(key, local); return local; }
+
+    throw new Error(`No se ha podido localizar «${raw}» dentro del área de Madrid.`
+        + (errors.length ? ` (${errors.slice(0, 2).join(' / ')})` : '')
+        + ' Prueba con «calle, número, distrito», con un número de parada, o con coordenadas «40.41,-3.70».');
 }
 
 function routeUseLocation() {
-    if(!window.isSecureContext){ alert('La ubicación necesita HTTPS.'); return; }
-    if(!navigator.geolocation){ alert('Tu navegador no permite obtener la ubicación.'); return; }
-    const btn=$('routeUseLocationBtn'); btn.disabled=true; btn.textContent='📍 Localizando...';
-    navigator.geolocation.getCurrentPosition(pos=>{
-        $('routeOrigin').value='Mi ubicación actual';
-        routeState.routeOriginCoords={lat:pos.coords.latitude,lon:pos.coords.longitude,label:'Mi ubicación actual'};
-        btn.disabled=false; btn.textContent='📍 Usar mi ubicación como origen';
-    },()=>{ btn.disabled=false; btn.textContent='📍 Usar mi ubicación como origen'; alert('No se ha podido obtener tu ubicación. Revisa el permiso del navegador.'); },{enableHighAccuracy:true,timeout:15000,maximumAge:30000});
+    if (!window.isSecureContext) { alert('La ubicación necesita HTTPS.'); return; }
+    if (!navigator.geolocation) { alert('Tu navegador no permite obtener la ubicación.'); return; }
+    const btn = $('routeUseLocationBtn'); btn.disabled = true; btn.textContent = '📍 Localizando...';
+    navigator.geolocation.getCurrentPosition(pos => {
+        $('routeOrigin').value = 'Mi ubicación actual';
+        routeState.routeOriginCoords = { lat: pos.coords.latitude, lon: pos.coords.longitude, label: 'Mi ubicación actual', source: 'gps' };
+        btn.disabled = false; btn.textContent = '📍 Usar mi ubicación como origen';
+    }, () => {
+        btn.disabled = false; btn.textContent = '📍 Usar mi ubicación como origen';
+        alert('No se ha podido obtener tu ubicación. Revisa el permiso del navegador.');
+    }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 });
 }
 
-function routeResolveEndpoint(input, isOrigin=false) {
-    if(isOrigin && routeState.routeOriginCoords && String(input).trim()==='Mi ubicación actual') return Promise.resolve(routeState.routeOriginCoords);
+function routeResolveEndpoint(input, isOrigin = false) {
+    if (isOrigin && routeState.routeOriginCoords && String(input).trim() === 'Mi ubicación actual') {
+        return Promise.resolve(routeState.routeOriginCoords);
+    }
     return routeGeocode(input);
 }
 
+/* ===== Presentacion =================================================== */
 function routeFormatKm(km) {
-    if(km<1) return `${Math.round(km*1000)} m`;
+    if (!Number.isFinite(km)) return '—';
+    if (km < 1) return `${Math.round(km * 1000)} m`;
     return `${km.toFixed(1)} km`;
 }
 
-function routeResultHtml(c, index) {
-    const totalWalk=c.walkStart+c.walkEnd+c.transferWalkKm;
-    const wait=c.segments.reduce((a,s)=>a+(Number.isFinite(s.waitMin)?s.waitMin:0),0);
-    let steps=`<div class="route-steps">`;
-    if(c.walkStart>0.01) steps+=`<div class="route-step walk"><div class="route-step-icon">🚶</div><div><div class="route-step-title">Camina ${routeFormatKm(c.walkStart)} hasta la parada ${escapeHtml(c.segments[0]?.boardStop || '')}</div><div class="route-step-sub">≈ ${routeWalkingMinutes(c.walkStart)} min a pie</div></div></div>`;
-    c.segments.forEach((s,i)=>{
-        const liveDest=s.liveDestination || s.live?.destino || s.terminal;
-        const liveWait=Number.isFinite(s.waitMin)?Math.max(0,Math.round(s.waitMin)):null;
-        const stops = s.dir?.stops?.slice(s.boardIndex, s.alightIndex + 1) || [];
+function routeClockFromNow(min) {
+    const d = new Date(Date.now() + min * 60000);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+function routeResultHtml(j) {
+    const totalWalk = j.walkStart + j.walkEnd + j.transferWalkKm;
+    const wait = j.segments.reduce((a, s) => a + (Number.isFinite(s.waitMin) ? s.waitMin : 0), 0);
+
+    let steps = '<div class="route-steps">';
+    if (j.walkStart > 0.01) {
+        steps += `<div class="route-step walk"><div class="route-step-icon">🚶</div><div>
+            <div class="route-step-title">Camina ${routeFormatKm(j.walkStart)} hasta la parada ${escapeHtml(j.segments[0]?.boardStop || '')}</div>
+            <div class="route-step-sub">≈ ${routeWalkingMinutes(j.walkStart)} min a pie</div></div></div>`;
+    }
+
+    j.segments.forEach((s, i) => {
+        const liveDest = s.liveDestination || s.live?.destino || s.terminal;
+        const w = Math.max(0, Math.round(s.waitMin));
+        const stops = s.route?.stops?.slice(s.boardIdx, s.alightIdx + 1) || [];
         const stopList = stops.map(st => `<span class="route-stop-chip">${escapeHtml(st.nombre || `Parada ${st.parada}`)} <strong>${escapeHtml(st.parada)}</strong></span>`).join('');
-        steps+=`<div class="route-step"><div class="route-step-icon">🚌</div><div>
-            <div class="route-step-title">${escapeHtml(s.line)} → ${escapeHtml(liveDest || s.terminal)}</div>
-            <div class="route-step-sub">Sube en parada <strong>${escapeHtml(s.boardStop)}</strong> · baja en <strong>${escapeHtml(s.alightStop)}</strong> · viaje ≈ ${s.rideMin} min</div>
-            ${liveWait!==null?`<div class="route-step-sub route-step-live">Próximo ${liveWait<=0?'ahora':`en ${liveWait} min`} según EMT</div>`:''}
-            <details class="route-stops-details"><summary>Ver ${stops.length} parada${stops.length===1?'':'s'} del trayecto</summary><div class="route-stop-list">${stopList}</div></details>
+        const boardName = routeStopInfo(s.boardStop)?.nombre || '';
+        const alightName = routeStopInfo(s.alightStop)?.nombre || '';
+
+        let liveLine;
+        if (s.liveStatus === 'ok') {
+            liveLine = `<div class="route-step-sub route-step-live">🟢 Próximo ${s.live.minutos <= 1 ? 'ahora' : `en ${s.live.minutos} min`} según EMT en tiempo real</div>`;
+        } else if (s.liveStatus === 'sin-dato') {
+            liveLine = `<div class="route-step-sub route-step-warn">🟡 EMT no anuncia ahora mismo esta línea en la parada. Espera estimada ≈ ${w} min.</div>`;
+        } else {
+            liveLine = `<div class="route-step-sub route-step-est">⏱️ Espera estimada ≈ ${w} min (intervalo medio de la línea)</div>`;
+        }
+
+        steps += `<div class="route-step"><div class="route-step-icon">🚌</div><div>
+            <div class="route-step-title"><span class="route-line-badge${s.route?.night ? ' night' : ''}">${escapeHtml(s.line)}</span> → ${escapeHtml(liveDest || s.terminal)}</div>
+            <div class="route-step-sub">Sube en <strong>${escapeHtml(s.boardStop)}</strong>${boardName ? ` · ${escapeHtml(boardName)}` : ''}</div>
+            <div class="route-step-sub">Baja en <strong>${escapeHtml(s.alightStop)}</strong>${alightName ? ` · ${escapeHtml(alightName)}` : ''} · ${stops.length - 1} parada${stops.length - 1 === 1 ? '' : 's'} · viaje ≈ ${Math.round(s.rideMin)} min</div>
+            ${liveLine}
+            <details class="route-stops-details"><summary>Ver ${stops.length} parada${stops.length === 1 ? '' : 's'} del trayecto</summary><div class="route-stop-list">${stopList}</div></details>
         </div></div>`;
-        if(i<c.segments.length-1){
-            const wk=(c.transferWalks||[])[i] || 0;
-            if(wk>0.01) steps+=`<div class="route-step walk"><div class="route-step-icon">🚶</div><div><div class="route-step-title">Transbordo a pie hasta la parada ${escapeHtml(c.segments[i+1].boardStop)}</div><div class="route-step-sub">≈ ${routeFormatKm(wk)} · ${routeWalkingMinutes(wk)} min</div></div></div>`;
+
+        if (i < j.segments.length - 1) {
+            const wk = (j.transferWalks || [])[i] || 0;
+            steps += `<div class="route-step walk"><div class="route-step-icon">🚶</div><div>
+                <div class="route-step-title">Transbordo hasta la parada ${escapeHtml(j.segments[i + 1].boardStop)}</div>
+                <div class="route-step-sub">${wk > 0.01 ? `≈ ${routeFormatKm(wk)} · ${routeWalkingMinutes(wk)} min a pie` : 'Misma parada'}</div></div></div>`;
         }
     });
-    if(c.walkEnd>0.01) steps+=`<div class="route-step walk"><div class="route-step-icon">🚶</div><div><div class="route-step-title">Camina ${routeFormatKm(c.walkEnd)} hasta el destino</div><div class="route-step-sub">≈ ${routeWalkingMinutes(c.walkEnd)} min a pie</div></div></div>`;
-    steps+=`</div>`;
-    return `<article class="route-card"><div class="route-card-head"><div><div class="route-time-main">≈ ${c.totalMin} min</div><div class="route-time-label">tiempo total estimado desde ahora</div></div><div class="route-transfers">${c.transfers===0?'Directo':`${c.transfers} transbordo${c.transfers===1?'':'s'}`}</div></div><div class="route-meta"><span>🚶 ${routeFormatKm(totalWalk)} a pie</span><span>⏱️ ${Math.round(wait)} min de espera</span><span>🚌 ${c.segments.length} línea${c.segments.length===1?'':'s'}</span><span class="route-step-live">🟢 primera salida ${c.firstDepartureMin<=1?'ahora':`en ${Math.round(c.firstDepartureMin)} min`}</span></div>${steps}</article>`;
+
+    if (j.walkEnd > 0.01) {
+        steps += `<div class="route-step walk"><div class="route-step-icon">🚶</div><div>
+            <div class="route-step-title">Camina ${routeFormatKm(j.walkEnd)} hasta el destino</div>
+            <div class="route-step-sub">≈ ${routeWalkingMinutes(j.walkEnd)} min a pie</div></div></div>`;
+    }
+    steps += '</div>';
+
+    const badges = [];
+    badges.push(j.liveConfirmed
+        ? `<span class="route-badge live">🟢 Salida confirmada en ${Math.round(j.firstDepartureMin)} min</span>`
+        : `<span class="route-badge est">⏱️ Horario estimado</span>`);
+    if (j.hasNight) badges.push('<span class="route-badge night">🌙 Incluye línea nocturna</span>');
+    if (j.hasSpecial) badges.push('<span class="route-badge night">⚠️ Incluye servicio especial</span>');
+
+    return `<article class="route-card">
+        <div class="route-card-head">
+            <div>
+                <div class="route-time-main">≈ ${j.totalMin} min</div>
+                <div class="route-time-label">llegada estimada sobre las ${routeClockFromNow(j.totalMin)}</div>
+            </div>
+            <div class="route-transfers">${j.transfers === 0 ? 'Directo' : `${j.transfers} transbordo${j.transfers === 1 ? '' : 's'}`}</div>
+        </div>
+        <div class="route-meta">
+            <span>🚶 ${routeFormatKm(totalWalk)} a pie</span>
+            <span>⏱️ ${Math.round(wait)} min de espera</span>
+            <span>🚌 ${j.segments.map(s => escapeHtml(s.line)).join(' → ')}</span>
+        </div>
+        <div class="route-badges">${badges.join('')}</div>
+        ${steps}
+    </article>`;
 }
+
+function routeWalkOnlyHtml(km) {
+    const min = routeWalkingMinutes(km * 1.3);
+    return `<article class="route-card">
+        <div class="route-card-head">
+            <div><div class="route-time-main">≈ ${min} min</div>
+            <div class="route-time-label">a pie, sin transbordos</div></div>
+            <div class="route-transfers">Andando</div>
+        </div>
+        <div class="route-meta"><span>🚶 ${routeFormatKm(km * 1.3)} aprox.</span><span>Sin autobús</span></div>
+        <div class="route-steps"><div class="route-step walk"><div class="route-step-icon">🚶</div><div>
+            <div class="route-step-title">Los dos puntos están muy cerca</div>
+            <div class="route-step-sub">Coger el autobús no compensa: el trayecto a pie es más rápido que esperar.</div>
+        </div></div></div></article>`;
+}
+
+function routeDiagnosticsHtml(d) {
+    const rows = [
+        ['Origen', `${escapeHtml(d.originLabel || '—')} <em>(${escapeHtml(d.originSource || '?')})</em>`],
+        ['Destino', `${escapeHtml(d.destLabel || '—')} <em>(${escapeHtml(d.destSource || '?')})</em>`],
+        ['Radio usado', `${d.radiusKm} km`],
+        ['Paradas candidatas', `${d.originStops} en origen · ${d.destStops} en destino`],
+        ['Red explorada', `${d.routesTotal} recorridos · ${d.stopsWithService} paradas con servicio`],
+        ['Rondas RAPTOR', `${d.rounds} (hasta ${d.rounds - 1} transbordos)`],
+        ['Recorridos escaneados', String(d.scannedRoutes)],
+        ['Itinerarios encontrados', String(d.found)],
+        ['PMVVisor', d.pmv ? `${d.pmv.correctas}/${d.pmv.consultadas} paradas con datos` : 'no consultado'],
+        ['Tiempo de cálculo', `${d.ms} ms`]
+    ];
+    return `<details class="route-diagnostics"><summary>Diagnóstico de la búsqueda</summary><dl>`
+        + rows.map(([k, v]) => `<div><dt>${escapeHtml(k)}</dt><dd>${v}</dd></div>`).join('')
+        + `</dl></details>`;
+}
+
+/* ===== Orquestacion =================================================== */
 async function searchRoutes() {
-    const token=++routeState.routeToken;
-    const originText=$('routeOrigin').value.trim(), destText=$('routeDestination').value.trim();
-    const resultsCard=$('routeResultsCard'), results=$('routeResults'), status=$('routeGeocodeStatus'), btn=$('routeSearchBtn');
-    if(!originText||!destText){ status.hidden=false; status.textContent='Introduce un origen y un destino.'; return; }
-    btn.disabled=true; resultsCard.hidden=false; results.innerHTML='<div class="route-loading">Preparando el mapa de paradas y buscando itinerarios...</div>'; status.hidden=false; status.textContent='Localizando origen y destino…';
-    try{
+    const token = ++routeState.routeToken;
+    const originText = $('routeOrigin').value.trim();
+    const destText = $('routeDestination').value.trim();
+    const resultsCard = $('routeResultsCard'), results = $('routeResults');
+    const status = $('routeGeocodeStatus'), btn = $('routeSearchBtn');
+    const onlyLive = $('routeOnlyLive')?.checked;
+
+    if (!originText || !destText) {
+        status.hidden = false;
+        status.textContent = 'Introduce un origen y un destino.';
+        return;
+    }
+
+    btn.disabled = true;
+    resultsCard.hidden = false;
+    $('routeResultsSummary').textContent = 'Buscando…';
+    results.innerHTML = '<div class="route-loading">Cargando la red de paradas…</div>';
+    status.hidden = false;
+    status.textContent = 'Localizando origen y destino…';
+
+    const t0 = performance.now();
+    const diagnostics = {};
+
+    try {
         await routeLoadCsv();
-        const [origin,destination]=await Promise.all([routeResolveEndpoint(originText,true),routeResolveEndpoint(destText,false)]);
-        if(token!==routeState.routeToken)return;
-        const origins=routeNearbyStops(origin.lat,origin.lon,ROUTE_MAX_WALK_KM,ROUTE_MAX_ORIGIN_STOPS);
-        const destinations=routeNearbyStops(destination.lat,destination.lon,ROUTE_MAX_WALK_KM,ROUTE_MAX_DEST_STOPS);
-        if(!origins.length||!destinations.length) throw new Error('No hay paradas EMT a menos de 1 km de uno de los puntos indicados.');
-        status.textContent=`Origen: ${origin.label} · Destino: ${destination.label}`;
+        if (token !== routeState.routeToken) return;
 
-        // No se pide al usuario el número de transbordos. El motor explora
-        // automáticamente hasta 4, pero la presentación siempre ordena por
-        // tiempo real y, en caso de empate, por menos transbordos.
-        const maxTransfers = ROUTE_AUTO_MAX_TRANSFERS;
-        let candidates=routeDirectCandidates(origins,destinations);
-        candidates=candidates.concat(routeOneTransferCandidates(origins,destinations));
-        candidates=candidates.concat(routeTwoTransferCandidates(origins,destinations));
-        await new Promise(resolve => requestAnimationFrame(resolve));
-        candidates=candidates.concat(routeMultiTransferCandidates(origins,destinations,maxTransfers));
-        candidates=candidates.filter(c=>c.transfers<=maxTransfers);
-        candidates=routeFilterCandidates(routeDeduplicate(candidates));
-        candidates.sort((a,b)=>routeScore(a)-routeScore(b) || a.transfers-b.transfers);
-        candidates=candidates.slice(0, 60);
+        // Geocodificacion SECUENCIAL: Nominatim limita a 1 peticion/segundo,
+        // y en V10 se lanzaban dos en paralelo (causa habitual de 429/403).
+        const origin = await routeResolveEndpoint(originText, true);
+        if (token !== routeState.routeToken) return;
+        const destination = await routeResolveEndpoint(destText, false);
+        if (token !== routeState.routeToken) return;
 
-        if(!candidates.length){ results.innerHTML='<div class="route-empty"><strong>No hemos encontrado itinerarios.</strong><br>Prueba con otro origen o destino.</div>'; return; }
-        results.innerHTML='<div class="route-loading">Comprobando salidas EMT disponibles ahora…</div>';
-        candidates=await routeApplyLiveTimes(candidates);
-        if(token!==routeState.routeToken)return;
-        candidates=routeDeduplicate(candidates);
-        candidates.sort((a,b)=>a.totalMin-b.totalMin || a.transfers-b.transfers);
-        const top=candidates.slice(0,ROUTE_MAX_RESULTS);
-        if(!top.length){
-            results.innerHTML='<div class="route-empty"><strong>No hay una combinación que pueda realizarse con las salidas EMT disponibles ahora.</strong><br>La aplicación solo muestra itinerarios para los que puede confirmar una salida real en cada tramo en el momento de la consulta.</div>';
-            $('routeResultsSummary').textContent='Sin itinerarios realizables ahora';
+        diagnostics.originLabel = origin.label;
+        diagnostics.originSource = origin.source;
+        diagnostics.destLabel = destination.label;
+        diagnostics.destSource = destination.source;
+        diagnostics.routesTotal = routeState.routes.length;
+        diagnostics.stopsWithService = routeState.routesByStop.size;
+        diagnostics.rounds = ROUTE_MAX_ROUNDS;
+
+        status.innerHTML = `<strong>Origen:</strong> ${escapeHtml(origin.label)}<br><strong>Destino:</strong> ${escapeHtml(destination.label)}`
+            + (origin.approximate || destination.approximate ? '<br><em>Alguno de los puntos es aproximado (localizado por nombre de calle).</em>' : '');
+        results.innerHTML = '<div class="route-loading">Buscando itinerarios en toda la red…</div>';
+
+        const straightKm = distanceKm(origin.lat, origin.lon, destination.lat, destination.lon);
+
+        // Preferencia de red segun la hora, pero SIN excluir nada:
+        // primero la red preferente, y si no da resultados, la red completa.
+        const w = routeServiceWindow();
+        const preferred = new Set();
+        routeState.routes.forEach((r, i) => {
+            if (w.isNight ? r.night : !r.night) preferred.add(i);
+        });
+
+        let journeys = [];
+        let usedRadius = ROUTE_ENDPOINT_RADII[0];
+        let scanned = 0;
+
+        for (const radius of ROUTE_ENDPOINT_RADII) {
+            usedRadius = radius;
+            const origins = routeServedNearbyStops(origin.lat, origin.lon, radius, ROUTE_MAX_ENDPOINT_STOPS);
+            const dests = routeServedNearbyStops(destination.lat, destination.lon, radius, ROUTE_MAX_ENDPOINT_STOPS);
+            diagnostics.originStops = origins.length;
+            diagnostics.destStops = dests.length;
+            if (!origins.length || !dests.length) continue;
+
+            await new Promise(r => requestAnimationFrame(r));
+            if (token !== routeState.routeToken) return;
+
+            let res = routeRaptor(origins, dests, { rounds: ROUTE_MAX_ROUNDS, allowed: preferred });
+            scanned += res.scannedRoutes;
+            journeys = res.journeys.slice();
+            let base = preferred;
+
+            // Si la red preferente no da nada, probamos con TODA la red
+            // (incluye nocturnas de dia y viceversa). Es preferible mostrar
+            // una ruta marcada que no mostrar nada.
+            if (!journeys.length) {
+                res = routeRaptor(origins, dests, { rounds: ROUTE_MAX_ROUNDS, allowed: null });
+                scanned += res.scannedRoutes;
+                journeys = res.journeys.slice();
+                base = null;
+            }
+
+            // Alternativas reales: repetimos la busqueda vetando las lineas
+            // del mejor itinerario. Sin esto, todas las opciones salen con
+            // las mismas lineas y solo cambia la parada de bajada.
+            const banned = new Set();
+            for (let pass = 0; pass < 2 && journeys.length; pass++) {
+                const ranked = [...journeys].sort((a, b) => a.totalMin - b.totalMin);
+                const target = ranked.find(j => j.segments.some(s => !banned.has(normalizeLine(s.line))));
+                if (!target) break;
+                for (const s of target.segments) banned.add(normalizeLine(s.line));
+                const allowedSet = new Set();
+                routeState.routes.forEach((r, i) => {
+                    if (base && !base.has(i)) return;
+                    if (banned.has(normalizeLine(r.label))) return;
+                    allowedSet.add(i);
+                });
+                const alt = routeRaptor(origins, dests, { rounds: ROUTE_MAX_ROUNDS, allowed: allowedSet });
+                scanned += alt.scannedRoutes;
+                journeys = journeys.concat(alt.journeys);
+                await new Promise(r => requestAnimationFrame(r));
+                if (token !== routeState.routeToken) return;
+            }
+
+            if (journeys.length) break;
+        }
+
+        diagnostics.radiusKm = usedRadius;
+        diagnostics.scannedRoutes = scanned;
+
+        journeys = routeParetoFilter(routeCollapseByLines(routeDeduplicate(journeys)));
+        diagnostics.found = journeys.length;
+
+        if (!journeys.length) {
+            diagnostics.ms = Math.round(performance.now() - t0);
+            const walkMin = routeWalkingMinutes(straightKm * 1.35);
+            if (straightKm < 2.5) {
+                $('routeResultsSummary').textContent = 'Mejor a pie';
+                results.innerHTML = routeWalkOnlyHtml(straightKm)
+                    + `<div class="route-empty"><strong>No hay ninguna línea EMT que una esos dos puntos mejor que ir andando.</strong>
+                       <p>Están a ${routeFormatKm(straightKm)} en línea recta.</p></div>`
+                    + routeDiagnosticsHtml(diagnostics);
+                return;
+            }
+            results.innerHTML = `<div class="route-empty">
+                <strong>No hay ninguna combinación de autobuses EMT entre esos dos puntos.</strong>
+                <p>Se ha explorado toda la red (${routeState.routes.length} recorridos, hasta ${ROUTE_MAX_ROUNDS - 1} transbordos y ${usedRadius} km a pie en cada extremo).</p>
+                <p>Distancia en línea recta: ${routeFormatKm(straightKm)} · a pie serían ≈ ${walkMin} min.</p>
+                <p>Comprueba que ambos puntos están dentro del área servida por EMT Madrid.</p>
+            </div>` + routeDiagnosticsHtml(diagnostics);
+            $('routeResultsSummary').textContent = 'Sin itinerarios';
             return;
         }
-        $('routeResultsSummary').textContent=`${top.length} alternativa${top.length===1?'':'s'} disponible${top.length===1?'':'s'} ahora · ordenadas por tiempo y, a igualdad, por transbordos`;
-        results.innerHTML=top.map(routeResultHtml).join('');
-    }catch(error){
-        if(token!==routeState.routeToken)return;
-        results.innerHTML=`<div class="route-empty">${escapeHtml(error.message || 'No se han podido calcular las rutas.')}</div>`;
-        status.hidden=false; status.textContent='No se ha podido completar la búsqueda.';
-    }finally{ if(token===routeState.routeToken) btn.disabled=false; }
+
+        // Mostramos YA el plan, sin esperar a PMVVisor.
+        $('routeResultsSummary').textContent = `${journeys.length} alternativa${journeys.length === 1 ? '' : 's'} · ordenadas por tiempo y transbordos · comprobando EMT…`;
+        results.innerHTML = journeys.map(routeResultHtml).join('');
+
+        try {
+            await routeEnrichWithLive(journeys, diagnostics);
+        } catch (e) {
+            diagnostics.pmv = { error: e.message };
+        }
+        if (token !== routeState.routeToken) return;
+
+        journeys.sort((a, b) => a.totalMin - b.totalMin || a.transfers - b.transfers);
+        let visible = journeys;
+        if (onlyLive) {
+            const confirmed = journeys.filter(j => j.liveConfirmed);
+            visible = confirmed.length ? confirmed : journeys;
+            if (!confirmed.length) {
+                status.innerHTML += '<br><em>Ninguna alternativa tiene salida confirmada ahora mismo; se muestran las estimadas.</em>';
+            }
+        }
+
+        diagnostics.ms = Math.round(performance.now() - t0);
+        diagnostics.found = visible.length;
+        routeState.lastDiagnostics = diagnostics;
+
+        const walkCard = straightKm < 1.2 ? routeWalkOnlyHtml(straightKm) : '';
+        const liveCount = visible.filter(j => j.liveConfirmed).length;
+        $('routeResultsSummary').textContent = `${visible.length} alternativa${visible.length === 1 ? '' : 's'} · ${liveCount} con salida confirmada por EMT`;
+        results.innerHTML = walkCard + visible.map(routeResultHtml).join('') + routeDiagnosticsHtml(diagnostics);
+
+    } catch (error) {
+        if (token !== routeState.routeToken) return;
+        diagnostics.ms = Math.round(performance.now() - t0);
+        $('routeResultsSummary').textContent = 'Búsqueda no completada';
+        results.innerHTML = `<div class="route-empty"><strong>${escapeHtml(error.message || 'No se han podido calcular las rutas.')}</strong></div>`
+            + routeDiagnosticsHtml(diagnostics);
+        status.hidden = false;
+        status.textContent = 'No se ha podido completar la búsqueda.';
+    } finally {
+        if (token === routeState.routeToken) btn.disabled = false;
+    }
 }
-$('routeSearchBtn').addEventListener('click',searchRoutes);
-$('routeSwapBtn').addEventListener('click',()=>{
-    const a=$('routeOrigin').value,b=$('routeDestination').value;
-    $('routeOrigin').value=b; $('routeDestination').value=a;
-    const tmp=routeState.routeOriginCoords; routeState.routeOriginCoords=routeState.routeDestinationCoords; routeState.routeDestinationCoords=tmp;
+
+$('routeSearchBtn').addEventListener('click', searchRoutes);
+$('routeSwapBtn').addEventListener('click', () => {
+    const a = $('routeOrigin').value, b = $('routeDestination').value;
+    $('routeOrigin').value = b; $('routeDestination').value = a;
+    const tmp = routeState.routeOriginCoords;
+    routeState.routeOriginCoords = routeState.routeDestinationCoords;
+    routeState.routeDestinationCoords = tmp;
 });
-$('routeUseLocationBtn').addEventListener('click',routeUseLocation);
-$('routeClearBtn').addEventListener('click',()=>{
-    $('routeOrigin').value=''; $('routeDestination').value=''; $('routeResults').innerHTML=''; $('routeResultsCard').hidden=true; $('routeGeocodeStatus').hidden=true; routeState.routeOriginCoords=null;
+$('routeUseLocationBtn').addEventListener('click', routeUseLocation);
+$('routeClearBtn').addEventListener('click', () => {
+    $('routeOrigin').value = ''; $('routeDestination').value = '';
+    $('routeResults').innerHTML = ''; $('routeResultsCard').hidden = true;
+    $('routeGeocodeStatus').hidden = true; routeState.routeOriginCoords = null;
 });
-['routeOrigin','routeDestination'].forEach(id=>$(id).addEventListener('keydown',e=>{if(e.key==='Enter')searchRoutes();}));
+['routeOrigin', 'routeDestination'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key === 'Enter') searchRoutes(); }));
+
+// Precarga en segundo plano: al abrir la pestaña de rutas el CSV ya esta listo.
+setTimeout(() => { routeLoadCsv().catch(() => {}); }, 1200);
 
 </script>
 
 <style>
+/* ===== V11 · RUTAS ===== */
+.route-toggle { display:flex; align-items:center; gap:9px; margin:14px 0 4px; color:var(--muted); font-size:12px; cursor:pointer; }
+.route-toggle input { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
+.route-note code { padding:1px 5px; border:1px solid var(--border); border-radius:6px; background:var(--panel-solid); font-size:11px; }
+.route-badges { display:flex; flex-wrap:wrap; gap:6px; margin:10px 0 2px; }
+.route-badge { padding:4px 9px; border:1px solid var(--border); border-radius:999px; font-size:10px; font-weight:800; color:var(--muted); background:var(--panel-solid); }
+.route-badge.live { color:var(--success); border-color:var(--success); }
+.route-badge.est  { color:var(--warning); border-color:var(--warning); }
+.route-badge.night{ color:var(--accent); border-color:var(--accent); }
+.route-line-badge { display:inline-block; padding:2px 8px; margin-right:5px; border-radius:8px; background:var(--accent-soft); color:var(--accent); font-weight:950; }
+.route-line-badge.night { background:rgba(90,90,200,.16); }
+.route-step-live { color:var(--success); }
+.route-step-warn { color:var(--warning); }
+.route-step-est  { color:var(--muted); }
+.route-diagnostics { margin-top:16px; padding:12px 14px; border:1px dashed var(--border); border-radius:14px; }
+.route-diagnostics summary { cursor:pointer; color:var(--muted); font-size:11px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; }
+.route-diagnostics dl { display:grid; gap:6px; margin:12px 0 0; }
+.route-diagnostics dl > div { display:grid; grid-template-columns:180px 1fr; gap:10px; font-size:11px; }
+.route-diagnostics dt { color:var(--muted); font-weight:800; }
+.route-diagnostics dd { margin:0; color:var(--text); word-break:break-word; }
+.route-diagnostics em { color:var(--muted); font-style:normal; font-size:10px; }
+@media (max-width:760px) { .route-diagnostics dl > div { grid-template-columns:1fr; gap:1px; } }
+.route-empty p { margin:8px 0 0; font-size:12px; color:var(--muted); font-weight:500; }
+
 /* ===== V10 · RUTAS EN TIEMPO REAL ===== */
 .route-controls { display:none !important; }
 .route-actions { margin-top: 14px; }
