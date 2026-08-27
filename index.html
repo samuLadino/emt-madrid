@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V11.2</title>
+<title>EMT Madrid · V11.3</title>
 
 <style>
 :root {
@@ -1122,7 +1122,7 @@ if (GOATCOUNTER_CODE) {
             <input type="checkbox" id="routeOnlyLive">
             <span>Mostrar solo itinerarios con la primera salida confirmada por EMT</span>
         </label>
-        <p class="route-note">V11.2: las direcciones se resuelven con <strong>CartoCiudad</strong> (el geocodificador oficial del IGN), m&aacute;s Photon y Nominatim. Si una direcci&oacute;n existe en varios puntos de Madrid, la app <strong>pregunta</strong>; y junto al origen y al destino resueltos tienes siempre un bot&oacute;n <em>cambiar</em> para corregirlo. El itinerario se calcula con RAPTOR sobre toda la red EMT. Acepta direcciones, nombres y n&uacute;meros de parada y coordenadas <code>40.41,-3.70</code>.</p>
+        <p class="route-note">V11.3: las direcciones se resuelven con <strong>CartoCiudad</strong> (geocodificador oficial del IGN), Photon y Nominatim. Si hay m&aacute;s de un sitio posible <strong>siempre pregunta</strong>, con enlace al mapa de cada opci&oacute;n, y puedes fijar el punto a mano con coordenadas o con un n&uacute;mero de parada. Junto al origen y al destino tienes un bot&oacute;n <em>cambiar</em> que abre ese selector cuando quieras. El itinerario se calcula con RAPTOR sobre toda la red EMT.</p>
         <div class="route-geocode-status" id="routeGeocodeStatus" hidden></div>
     </section>
 
@@ -2944,27 +2944,74 @@ function routeJsonp(url, { timeout = 8000 } = {}) {
  * (IGN + Catastro + INE). Para un portal concreto de Madrid es bastante
  * mas fiable que OpenStreetMap, que es donde V11.0 se equivocaba de calle.
  */
+function routeCartoMap(c, want) {
+    const lat = Number(c.lat ?? c.latitud ?? c.y);
+    const lon = Number(c.lng ?? c.lon ?? c.longitud ?? c.x);
+    return {
+        lat, lon, source: 'cartociudad',
+        type: c.type, category: 'address', importance: 0.2,
+        portalExacto: want.numero ? String(c.portalNumber ?? '') === String(want.numero) : false,
+        name: c.address,
+        address: {
+            road: c.address,
+            house_number: c.portalNumber != null ? String(c.portalNumber) : undefined,
+            suburb: c.poblacion && c.poblacion !== c.muni ? c.poblacion : (c.tip_via || ''),
+            city: c.muni,
+            postcode: c.postalCode
+        },
+        display_name: [c.address, c.portalNumber, c.poblacion, c.muni, c.postalCode].filter(Boolean).join(', ')
+    };
+}
+
+/*
+ * CartoCiudad es el geocodificador OFICIAL de direcciones de España
+ * (IGN + Catastro + INE). Lanzamos VARIAS formulaciones porque un mismo
+ * portal puede no aparecer con todas: "Calle del Aire 36" y "Aire 36"
+ * pueden devolver conjuntos distintos, y basta con que una de ellas
+ * saque el portal correcto para que aparezca en el selector.
+ */
 async function routeCartoCiudad(want) {
-    const q = want.numero ? `${want.via}, ${want.numero}, Madrid` : `${want.via}, Madrid`;
-    const url = `https://www.cartociudad.es/geocoder/api/geocoder/candidatesJsonp?q=${encodeURIComponent(q)}&limit=12&no_process=municipio,poblacion,toponimo&countryCode=011`;
-    const data = await routeJsonp(url);
-    const list = Array.isArray(data) ? data : (data?.candidates || data?.results || []);
-    return list.map(c => {
-        const lat = Number(c.lat ?? c.latitud ?? c.y);
-        const lon = Number(c.lng ?? c.lon ?? c.longitud ?? c.x);
-        return {
-            lat, lon, source: 'cartociudad',
-            type: c.type, category: 'address',
-            importance: 0.2,
-            portalExacto: want.numero ? String(c.portalNumber ?? '') === String(want.numero) : false,
-            name: c.address,
-            address: {
-                road: c.address, house_number: c.portalNumber != null ? String(c.portalNumber) : undefined,
-                suburb: c.poblacion || c.tip_via, city: c.muni, postcode: c.postalCode
-            },
-            display_name: [c.address, c.portalNumber, c.poblacion, c.muni, c.postalCode].filter(Boolean).join(', ')
-        };
-    }).filter(c => Number.isFinite(c.lat) && Number.isFinite(c.lon));
+    const viaCorta = want.via.replace(/^(calle|c\/|avenida|avda|av\.?|paseo|plaza|pza\.?|glorieta|gta\.?|ronda|camino|travesia|travesía)\s+/i, '');
+    const n = want.numero;
+    const consultas = [
+        n ? `${want.via}, ${n}, Madrid` : `${want.via}, Madrid`,
+        n ? `${viaCorta}, ${n}, Madrid` : `${viaCorta}, Madrid`,
+        n ? `${viaCorta} ${n}, Madrid, Madrid` : `${viaCorta}, Madrid, Madrid`
+    ].filter((v, i, a) => a.indexOf(v) === i);
+
+    const out = [];
+    const vistos = new Set();
+    const errores = [];
+
+    for (const q of consultas) {
+        const url = `https://www.cartociudad.es/geocoder/api/geocoder/candidatesJsonp?q=${encodeURIComponent(q)}&limit=15&countryCode=011`;
+        try {
+            const data = await routeJsonp(url, { timeout: 7000 });
+            const list = Array.isArray(data) ? data : (data?.candidates || data?.results || []);
+            for (const c of list) {
+                const m = routeCartoMap(c, want);
+                if (!Number.isFinite(m.lat) || !Number.isFinite(m.lon)) continue;
+                const k = `${m.lat.toFixed(5)}|${m.lon.toFixed(5)}`;
+                if (vistos.has(k)) continue;
+                vistos.add(k); out.push(m);
+            }
+        } catch (e) { errores.push(e.message); }
+    }
+
+    // findJsonp resuelve la direccion "mejor" segun el IGN; a veces devuelve
+    // un portal que candidatesJsonp no lista.
+    if (n) {
+        try {
+            const url = `https://www.cartociudad.es/geocoder/api/geocoder/findJsonp?q=${encodeURIComponent(`${want.via}, ${n}, Madrid`)}`;
+            const c = await routeJsonp(url, { timeout: 7000 });
+            const m = routeCartoMap(c || {}, want);
+            const k = `${m.lat?.toFixed?.(5)}|${m.lon?.toFixed?.(5)}`;
+            if (Number.isFinite(m.lat) && Number.isFinite(m.lon) && !vistos.has(k)) { vistos.add(k); out.push(m); }
+        } catch (e) { errores.push(e.message); }
+    }
+
+    if (!out.length && errores.length) throw new Error(errores[0]);
+    return out;
 }
 
 let routeGeoLastCall = 0;
@@ -3133,12 +3180,16 @@ async function routeGeocodeCandidates(raw, { quick = false } = {}) {
  */
 function routeIsAmbiguous(cands) {
     if (cands.length < 2) return false;
-    const [a, b] = cands;
+    const [a] = cands;
+
+    // Una parada EMT nombrada exactamente no admite duda.
     if (a.source === 'parada' && a.score >= 9) return false;
-    // Preferimos preguntar de mas que acertar de menos: basta con que el
-    // segundo candidato este en otra zona y no sea claramente peor.
-    const far = distanceKm(a.lat, a.lon, b.lat, b.lon) > 0.35;
-    return far && (a.score - b.score) < 4;
+
+    // Regla simple y sin adivinanzas: solo damos por buena la primera
+    // opcion cuando TODAS las demas apuntan practicamente al mismo sitio.
+    // Si alguna se va a otro barrio, preguntamos. Un clic de mas es mucho
+    // mejor que calcular una ruta impecable a la punta contraria de Madrid.
+    return cands.some(c => distanceKm(a.lat, a.lon, c.lat, c.lon) > 0.35);
 }
 
 class RouteAmbiguity extends Error {
@@ -3304,21 +3355,68 @@ function routeResultHtml(j) {
     </article>`;
 }
 
+function routeOsmLink(lat, lon) {
+    return `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=18/${lat}/${lon}`;
+}
+
 function routeChoiceHtml(err) {
     const campo = err.field === 'origin' ? 'origen' : 'destino';
-    const items = err.candidates.map((c, i) => `
-        <button type="button" class="route-choice" data-choice="${i}">
-            <span class="route-choice-icon">${c.source === 'parada' ? '🚏' : '📍'}</span>
-            <span>
-                <span class="route-choice-title">${escapeHtml(c.short || c.label)}</span>
-                <span class="route-choice-sub">${escapeHtml((c.detail || c.label || '').slice(0, 110))}</span>
-            </span>
-        </button>`).join('');
+    const otro = routeState.pinned[err.field === 'origin' ? 'destination' : 'origin'];
+
+    const items = err.candidates.map((c, i) => {
+        const dist = otro && Number.isFinite(otro.lat)
+            ? `<span class="route-choice-dist">a ${routeFormatKm(distanceKm(c.lat, c.lon, otro.lat, otro.lon))} del otro punto</span>` : '';
+        return `<div class="route-choice-row">
+            <button type="button" class="route-choice" data-choice="${i}">
+                <span class="route-choice-icon">${c.source === 'parada' ? '🚏' : '📍'}</span>
+                <span>
+                    <span class="route-choice-title">${escapeHtml(c.short || c.label)}</span>
+                    <span class="route-choice-sub">${escapeHtml((c.detail || c.label || '').slice(0, 110))}</span>
+                    ${dist}
+                </span>
+            </button>
+            <a class="route-choice-map" href="${routeOsmLink(c.lat, c.lon)}" target="_blank" rel="noopener" title="Ver en el mapa">🗺️</a>
+        </div>`;
+    }).join('');
+
     return `<div class="route-choice-card">
         <strong>¿Cuál de estas es tu ${campo}?</strong>
-        <p>En Madrid hay más de un sitio que encaja con «${escapeHtml(err.text)}». Elige uno y repito la búsqueda.</p>
+        <p>En Madrid puede haber varias direcciones con ese nombre, así que no elijo por ti. Pulsa 🗺️ para comprobar cualquiera en el mapa antes de decidir.</p>
         <div class="route-choice-list">${items}</div>
+        <div class="route-manual">
+            <label for="routeManualPoint">¿No está ninguna? Pon el ${campo} a mano:</label>
+            <div class="route-manual-row">
+                <input id="routeManualPoint" type="text" placeholder="40.3934,-3.6532  ·  parada 1009  ·  nombre de parada">
+                <button type="button" class="small-btn" id="routeManualBtn">Usar</button>
+            </div>
+            <span class="route-manual-hint">En Google Maps: pulsación larga sobre el punto y copia las coordenadas que aparecen.</span>
+        </div>
     </div>`;
+}
+
+/* Conecta los botones del selector. Se usa desde varios sitios. */
+function routeBindChoice(container, err, onPick) {
+    container.querySelectorAll('[data-choice]').forEach(btn => btn.addEventListener('click', () => {
+        onPick(err.candidates[Number(btn.dataset.choice)]);
+    }));
+
+    const manualBtn = container.querySelector('#routeManualBtn');
+    const manualInput = container.querySelector('#routeManualPoint');
+    const useManual = async () => {
+        const raw = String(manualInput.value || '').trim();
+        if (!raw) return;
+        try {
+            const point = await routeGeocode(raw, err.field);
+            onPick(point);
+        } catch (e) {
+            manualInput.value = '';
+            manualInput.placeholder = e instanceof RouteAmbiguity
+                ? 'Sigue habiendo varias: usa coordenadas o un número de parada'
+                : 'No he podido interpretarlo. Prueba con 40.39,-3.65';
+        }
+    };
+    if (manualBtn) manualBtn.addEventListener('click', useManual);
+    if (manualInput) manualInput.addEventListener('keydown', e => { if (e.key === 'Enter') useManual(); });
 }
 
 function routeWalkOnlyHtml(km) {
@@ -3423,18 +3521,21 @@ async function searchRoutes() {
                 try { cands = await routeGeocodeCandidates(text); } catch { cands = []; }
             }
             if (tk !== routeState.routeToken) return;
-            if (!cands.length) { results.innerHTML = '<div class="route-empty">No hay otras coincidencias para ese texto.</div>'; return; }
             const err = new RouteAmbiguity(field, text, cands.slice(0, 8));
             results.innerHTML = routeChoiceHtml(err);
-            results.querySelectorAll('[data-choice]').forEach(btn => btn.addEventListener('click', () => {
+            routeBindChoice(results, err, c => {
                 if (tk !== routeState.routeToken) return;
-                routeState.pinned[field] = { ...err.candidates[Number(btn.dataset.choice)], text };
+                routeState.pinned[field] = { ...c, text };
                 searchRoutes();
-            }));
+            });
         }));
         results.innerHTML = '<div class="route-loading">Buscando itinerarios en toda la red…</div>';
 
         const straightKm = distanceKm(origin.lat, origin.lon, destination.lat, destination.lon);
+        if (straightKm > 12) {
+            status.innerHTML += `<div class="route-warn">⚠️ Origen y destino están a ${routeFormatKm(straightKm)} en línea recta. `
+                + `Si no es lo que esperabas, pulsa <strong>cambiar</strong> para revisar la dirección.</div>`;
+        }
 
         // Preferencia de red segun la hora, pero SIN excluir nada:
         // primero la red preferente, y si no da resultados, la red completa.
@@ -3565,14 +3666,10 @@ async function searchRoutes() {
             routeState.pendingChoice = error;
             $('routeResultsSummary').textContent = 'Elige la dirección correcta';
             results.innerHTML = routeChoiceHtml(error);
-            results.querySelectorAll('[data-choice]').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    const c = error.candidates[Number(btn.dataset.choice)];
-                    routeState.pinned[error.field] = { ...c, text: error.text };
-                    const input = $(error.field === 'origin' ? 'routeOrigin' : 'routeDestination');
-                    input.value = error.text;
-                    searchRoutes();
-                });
+            routeBindChoice(results, error, c => {
+                routeState.pinned[error.field] = { ...c, text: error.text };
+                $(error.field === 'origin' ? 'routeOrigin' : 'routeDestination').value = error.text;
+                searchRoutes();
             });
             status.hidden = false;
             status.textContent = `Hay varias coincidencias para «${error.text}».`;
@@ -3675,6 +3772,17 @@ setTimeout(() => { routeLoadCsv().catch(() => {}); }, 1200);
 
 <style>
 /* ===== V11 · RUTAS ===== */
+.route-choice-row { display:grid; grid-template-columns:1fr 42px; gap:7px; align-items:stretch; }
+.route-choice-map { display:grid; place-items:center; border:1px solid var(--border); border-radius:13px; background:var(--panel); text-decoration:none; font-size:17px; }
+.route-choice-map:hover { border-color:var(--accent); background:var(--accent-soft); }
+.route-choice-dist { display:block; margin-top:4px; color:var(--accent); font-size:10px; font-weight:800; }
+.route-manual { margin-top:16px; padding-top:14px; border-top:1px dashed var(--border); }
+.route-manual label { display:block; color:var(--muted); font-size:11px; font-weight:800; margin-bottom:7px; }
+.route-manual-row { display:grid; grid-template-columns:1fr auto; gap:8px; }
+.route-manual-row input { padding:10px 12px; border:1px solid var(--border); border-radius:12px; background:var(--panel-solid); color:var(--text); font:inherit; font-size:12px; width:100%; }
+.route-manual-row input:focus { outline:none; border-color:var(--accent); }
+.route-manual-hint { display:block; margin-top:7px; color:var(--muted); font-size:10px; }
+.route-warn { margin-top:9px; padding:9px 11px; border:1px solid var(--warning); border-radius:11px; color:var(--warning); font-size:11px; }
 .route-input-wrap { position: relative; }
 .route-suggest { position:absolute; z-index:40; left:0; right:0; top:calc(100% + 6px); display:none; overflow:hidden;
     border:1px solid var(--border); border-radius:14px; background:var(--panel-solid); box-shadow:var(--shadow); }
