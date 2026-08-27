@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V11</title>
+<title>EMT Madrid · V11.1</title>
 
 <style>
 :root {
@@ -1122,7 +1122,7 @@ if (GOATCOUNTER_CODE) {
             <input type="checkbox" id="routeOnlyLive">
             <span>Mostrar solo itinerarios con la primera salida confirmada por EMT</span>
         </label>
-        <p class="route-note">V11: el itinerario se calcula sobre toda la red EMT (algoritmo RAPTOR, hasta 5 transbordos) y los datos en tiempo real de PMVVisor solo <strong>ajustan</strong> la espera del primer tramo &mdash; ya no descartan rutas. Si no hay paradas cerca, el radio de b&uacute;squeda se ampl&iacute;a solo hasta 3&nbsp;km. Acepta direcciones, nombres de parada, n&uacute;meros de parada y coordenadas <code>40.41,-3.70</code>.</p>
+        <p class="route-note">V11.1: el itinerario se calcula sobre toda la red EMT (algoritmo RAPTOR, hasta 5 transbordos) y PMVVisor solo <strong>ajusta</strong> la espera del primer tramo &mdash; ya no descarta rutas. Cuando una direcci&oacute;n existe en varios puntos de Madrid (por ejemplo <em>Calle del Aire</em>), la app <strong>pregunta</strong> en vez de elegir por ti. Acepta direcciones, nombres y n&uacute;meros de parada y coordenadas <code>40.41,-3.70</code>.</p>
         <div class="route-geocode-status" id="routeGeocodeStatus" hidden></div>
     </section>
 
@@ -2221,8 +2221,8 @@ const routeState = {
     geocodeCache: new Map(),
     routeToken: 0,
     lastDiagnostics: null,
-    routeOriginCoords: null,
-    routeDestinationCoords: null
+    pinned: { origin: null, destination: null },
+    pendingChoice: null
 };
 
 /* --- Parametros del modelo ------------------------------------------- */
@@ -2872,7 +2872,17 @@ async function routeEnrichWithLive(journeys, diagnostics) {
     return journeys;
 }
 
-/* ===== Geocodificacion robusta ======================================== */
+/* ===== Geocodificacion con desambiguacion ==============================
+ *
+ * El fallo de "Calle del Aire 36": en Madrid hay mas de una via con ese
+ * nombre y V11.0 se quedaba con el PRIMER resultado de Nominatim dentro de
+ * la caja de Madrid, que era el de Barajas. El motor calculaba bien la ruta
+ * a un destino equivocado (143 min a Barajas en vez de 71 a Vallecas).
+ *
+ * V11.1 ya no adivina: reune candidatos de varias fuentes, los puntua y,
+ * si hay ambiguedad real, PREGUNTA. Ademas hay sugerencias al escribir.
+ * ======================================================================= */
+
 function routeGeoStoreLoad() {
     try {
         const raw = localStorage.getItem(ROUTE_GEO_STORE);
@@ -2903,138 +2913,213 @@ async function routeThrottleGeo(minGapMs = 1100) {
     routeGeoLastCall = Date.now();
 }
 
-async function routeTryNominatim(query) {
-    await routeThrottleGeo();
-    const vb = `${ROUTE_MADRID_BBOX.minLon},${ROUTE_MADRID_BBOX.maxLat},${ROUTE_MADRID_BBOX.maxLon},${ROUTE_MADRID_BBOX.minLat}`;
-    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&countrycodes=es&accept-language=es`
-        + `&viewbox=${vb}&bounded=1&q=${encodeURIComponent(query)}`;
-    const res = await fetch(url, { headers: { 'Accept': 'application/json' }, cache: 'no-store' });
-    if (!res.ok) throw new Error(`Nominatim HTTP ${res.status}`);
-    const data = await res.json();
-    for (const item of data) {
-        const lat = Number(item.lat), lon = Number(item.lon);
-        if (routeInMadrid(lat, lon)) return { lat, lon, label: item.display_name, source: 'nominatim' };
-    }
-    return null;
+/* Separa "Calle del Aire 36" en { via: "Calle del Aire", numero: "36" } */
+function routeSplitAddress(raw) {
+    const text = String(raw || '').trim().replace(/\s+/g, ' ');
+    const m = text.match(/^(.*?)[\s,]+(?:n[ºo°.]?\s*)?(\d{1,4})\s*(?:[a-dA-D])?$/);
+    if (m && m[1].trim().length >= 3) return { via: m[1].replace(/[,\s]+$/, '').trim(), numero: m[2] };
+    return { via: text, numero: '' };
 }
 
-async function routeTryPhoton(query) {
-    const url = `https://photon.komoot.io/api/?limit=5&lang=es&lat=40.4168&lon=-3.7038&q=${encodeURIComponent(query)}`;
-    const res = await fetch(url, { headers: { 'Accept': 'application/json' }, cache: 'no-store' });
-    if (!res.ok) throw new Error(`Photon HTTP ${res.status}`);
-    const data = await res.json();
-    for (const f of (data.features || [])) {
-        const [lon, lat] = f.geometry?.coordinates || [];
-        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-        if (!routeInMadrid(lat, lon)) continue;
-        const p = f.properties || {};
-        const label = [p.name, p.housenumber, p.street, p.district, p.city].filter(Boolean).join(', ');
-        return { lat, lon, label: label || 'Resultado Photon', source: 'photon' };
+function routeCandidateShort(item) {
+    const a = item.address || {};
+    const via = a.road || a.pedestrian || a.square || a.suburb || item.name || '';
+    const num = a.house_number ? `, ${a.house_number}` : '';
+    const zona = a.suburb || a.quarter || a.city_district || a.district || '';
+    const muni = a.city || a.town || a.village || a.municipality || '';
+    const partes = [`${via}${num}`.trim(), zona, muni].filter((v, i, arr) => v && arr.indexOf(v) === i);
+    return partes.join(' · ') || item.display_name || 'Resultado';
+}
+
+/* Puntuacion: numero de portal exacto > municipio Madrid > tipo de objeto. */
+function routeScoreCandidate(c, want) {
+    let score = 0;
+    const a = c.address || {};
+    if (want.numero && a.house_number) {
+        score += (String(a.house_number) === String(want.numero)) ? 5 : 1.5;
     }
-    return null;
+    const muni = routeNormalize(a.city || a.town || a.municipality || a.village || '');
+    if (muni === 'MADRID') score += 2.5;
+    else if (muni) score += 0.5;
+    if (['house', 'building', 'residential'].includes(c.type)) score += 1.2;
+    if (c.category === 'highway') score += 0.4;
+    if (want.via && routeNormalize(a.road || '').startsWith(routeNormalize(want.via).replace(/^(CALLE|AVENIDA|PASEO|PLAZA|RONDA|CAMINO|GLORIETA)\s+/, ''))) score += 1;
+    score += Math.min(1.5, Number(c.importance || 0) * 3);
+    if (c.source === 'photon') score -= 0.3;
+    return score;
+}
+
+async function routeNominatimStructured(want) {
+    await routeThrottleGeo();
+    const street = want.numero ? `${want.numero} ${want.via}` : want.via;
+    const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&limit=10'
+        + '&countrycodes=es&accept-language=es'
+        + `&street=${encodeURIComponent(street)}&city=${encodeURIComponent('Madrid')}`;
+    const res = await fetch(url, { headers: { Accept: 'application/json' }, cache: 'no-store' });
+    if (!res.ok) throw new Error(`Nominatim HTTP ${res.status}`);
+    return (await res.json()).map(x => ({ ...x, source: 'nominatim-estructurada' }));
+}
+
+async function routeNominatimFree(query) {
+    await routeThrottleGeo();
+    const vb = `${ROUTE_MADRID_BBOX.minLon},${ROUTE_MADRID_BBOX.maxLat},${ROUTE_MADRID_BBOX.maxLon},${ROUTE_MADRID_BBOX.minLat}`;
+    const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&limit=10'
+        + `&countrycodes=es&accept-language=es&viewbox=${vb}&bounded=1&q=${encodeURIComponent(query)}`;
+    const res = await fetch(url, { headers: { Accept: 'application/json' }, cache: 'no-store' });
+    if (!res.ok) throw new Error(`Nominatim HTTP ${res.status}`);
+    return (await res.json()).map(x => ({ ...x, source: 'nominatim' }));
+}
+
+async function routePhoton(query, limit = 10) {
+    const url = `https://photon.komoot.io/api/?limit=${limit}&lang=es&lat=40.4168&lon=-3.7038&q=${encodeURIComponent(query)}`;
+    const res = await fetch(url, { headers: { Accept: 'application/json' }, cache: 'no-store' });
+    if (!res.ok) throw new Error(`Photon HTTP ${res.status}`);
+    return (res.ok ? (await res.json()).features || [] : []).map(f => {
+        const p = f.properties || {};
+        const [lon, lat] = f.geometry?.coordinates || [];
+        return {
+            lat, lon, source: 'photon', type: p.osm_value, category: p.osm_key,
+            importance: 0,
+            name: p.name,
+            address: { road: p.street || p.name, house_number: p.housenumber, suburb: p.district, city: p.city, postcode: p.postcode },
+            display_name: [p.name, p.street, p.housenumber, p.district, p.city].filter(Boolean).join(', ')
+        };
+    });
+}
+
+/* Paradas EMT que encajan con el texto (siempre disponibles, sin red). */
+function routeStopCandidates(raw, limit = 4) {
+    const q = routeNormalize(raw);
+    if (q.length < 3) return [];
+    const out = [];
+    for (const s of STOP_DIRECTORY) {
+        const nom = routeNormalize(s.nombre), dir = routeNormalize(s.direccion || '');
+        let score = 0;
+        if (nom === q) score = 9;
+        else if (nom.startsWith(q)) score = 7;
+        else if (nom.includes(q)) score = 5;
+        else if (dir.startsWith(q)) score = 4.5;
+        else continue;
+        out.push({
+            lat: s.lat, lon: s.lon, score, source: 'parada', stop: s,
+            label: `Parada ${s.parada} · ${s.nombre}`,
+            short: `Parada ${s.parada} · ${s.nombre}`,
+            detail: s.direccion || ''
+        });
+    }
+    out.sort((a, b) => b.score - a.score);
+    return out.slice(0, limit);
+}
+
+/* Reune y ordena candidatos. `quick` usa solo fuentes rapidas (sugerencias). */
+async function routeGeocodeCandidates(raw, { quick = false } = {}) {
+    const want = routeSplitAddress(raw);
+    const results = [];
+    const errors = [];
+
+    for (const c of routeStopCandidates(raw)) results.push(c);
+
+    const collect = list => {
+        for (const item of list) {
+            const lat = Number(item.lat), lon = Number(item.lon);
+            if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+            if (!routeInMadrid(lat, lon)) continue;
+            results.push({
+                lat, lon, source: item.source,
+                score: routeScoreCandidate(item, want),
+                label: item.display_name || routeCandidateShort(item),
+                short: routeCandidateShort(item),
+                detail: item.display_name || '',
+                address: item.address
+            });
+        }
+    };
+
+    try { collect(await routePhoton(want.numero ? `${want.via} ${want.numero}, Madrid` : `${want.via}, Madrid`)); }
+    catch (e) { errors.push(`Photon: ${e.message}`); }
+
+    if (!quick) {
+        try { collect(await routeNominatimStructured(want)); }
+        catch (e) { errors.push(`Nominatim: ${e.message}`); }
+        if (results.length < 3) {
+            try { collect(await routeNominatimFree(`${raw}, Madrid, España`)); }
+            catch (e) { errors.push(`Nominatim: ${e.message}`); }
+        }
+    }
+
+    // Fusion: dos resultados a menos de 150 m son el mismo sitio.
+    results.sort((a, b) => b.score - a.score);
+    const merged = [];
+    for (const c of results) {
+        if (merged.some(m => distanceKm(m.lat, m.lon, c.lat, c.lon) < 0.15)) continue;
+        merged.push(c);
+    }
+    merged.errors = errors;
+    return merged;
 }
 
 /*
- * Ultimo recurso sin red: busca la calle en las direcciones de las propias
- * paradas EMT. No es exacto al numero de portal, pero situa el punto en la
- * calle correcta, que es suficiente para planificar.
+ * Hay ambiguedad si el segundo candidato esta LEJOS del primero y no es
+ * claramente peor. En ese caso preguntamos en vez de elegir por el usuario.
  */
-function routeLocalStreetMatch(query) {
-    const q = routeNormalize(query)
-        .replace(/^(CALLE|C\/|C\.|AVENIDA|AVDA|AV\.?|PASEO|PSO|PZA\.?|PLAZA|GLORIETA|GTA\.?|RONDA|CAMINO|CTRA|CARRETERA|TRAVESIA)\s+/, '');
-    const numberMatch = q.match(/\b(\d{1,4})\b\s*$/);
-    const street = (numberMatch ? q.slice(0, numberMatch.index) : q).replace(/[,\s]+$/, '').trim();
-    if (street.length < 5) return null;
-
-    const scored = [];
-    for (const s of STOP_DIRECTORY) {
-        const dir = routeNormalize(s.direccion || '');
-        const nom = routeNormalize(s.nombre || '');
-        // Solo aceptamos coincidencias fuertes: la direccion EMPIEZA por la
-        // calle, o el nombre de la parada la contiene como componente. Asi
-        // evitamos falsos positivos del tipo "DEL AIRE" dentro de
-        // "EJERCITO DEL AIRE".
-        let score = 0;
-        if (dir.startsWith(street)) score = 4;
-        else if (nom.split(/[-·\/]/).some(part => part.trim() === street)) score = 3;
-        else continue;
-
-        if (numberMatch) {
-            const m = dir.match(/\b(\d{1,4})\b/);
-            if (m) score += Math.max(0, 2 - Math.abs(Number(m[1]) - Number(numberMatch[1])) / 60);
-        }
-        scored.push({ s, score });
-    }
-    if (!scored.length) return null;
-
-    scored.sort((a, b) => b.score - a.score);
-    const top = scored.slice(0, 3);
-    const lat = top.reduce((a, x) => a + x.s.lat, 0) / top.length;
-    const lon = top.reduce((a, x) => a + x.s.lon, 0) / top.length;
-    return {
-        lat, lon,
-        label: `Aproximado por calle · cerca de «${top[0].s.direccion || top[0].s.nombre}»`,
-        source: 'aproximado',
-        approximate: true
-    };
+function routeIsAmbiguous(cands) {
+    if (cands.length < 2) return false;
+    const [a, b] = cands;
+    if (a.source === 'parada' && a.score >= 9) return false;
+    const far = distanceKm(a.lat, a.lon, b.lat, b.lon) > 0.6;
+    return far && (a.score - b.score) < 2.5;
 }
 
-async function routeGeocode(input) {
+class RouteAmbiguity extends Error {
+    constructor(field, text, candidates) {
+        super(`Hay varias direcciones posibles para «${text}».`);
+        this.field = field; this.text = text; this.candidates = candidates;
+    }
+}
+
+async function routeGeocode(input, field = 'destination') {
     const raw = String(input || '').trim();
     if (!raw) throw new Error('Falta el texto a localizar.');
 
-    // 1. Coordenadas directas "40.41,-3.70"
+    // Coordenadas directas
     const coord = raw.match(/^\s*(-?\d{1,3}(?:[.,]\d+)?)\s*,\s*(-?\d{1,3}(?:[.,]\d+)?)\s*$/);
     if (coord) {
         const lat = Number(coord[1].replace(',', '.')), lon = Number(coord[2].replace(',', '.'));
-        if (Number.isFinite(lat) && Number.isFinite(lon)) return { lat, lon, label: `Coordenadas ${lat.toFixed(5)}, ${lon.toFixed(5)}`, source: 'coords' };
+        if (Number.isFinite(lat) && Number.isFinite(lon)) {
+            return { lat, lon, label: `Coordenadas ${lat.toFixed(5)}, ${lon.toFixed(5)}`, source: 'coordenadas' };
+        }
     }
 
-    // 2. Numero de parada
+    // Numero de parada
     const stopMatch = raw.match(/^(?:parada\s*)?(\d{1,5})$/i);
     if (stopMatch) {
         const s = routeStopInfo(stopMatch[1]);
         if (s) return { lat: s.lat, lon: s.lon, label: `Parada ${s.parada} · ${s.nombre}`, stop: s, source: 'parada' };
     }
 
-    // 3. Nombre exacto de parada del directorio
+    // Nombre exacto de parada
     const nameHit = STOP_DIRECTORY.find(s => routeNormalize(s.nombre) === routeNormalize(raw));
     if (nameHit) return { lat: nameHit.lat, lon: nameHit.lon, label: `Parada ${nameHit.parada} · ${nameHit.nombre}`, stop: nameHit, source: 'parada' };
 
-    // 4. Cache
+    // Cache (solo si en su dia no hubo ambiguedad)
     const key = routeNormalize(raw);
     if (routeState.geocodeCache.has(key)) return routeState.geocodeCache.get(key);
     const stored = routeGeoStoreLoad()[key];
     if (stored?.v) { routeState.geocodeCache.set(key, stored.v); return stored.v; }
 
-    // 5. Proveedores externos, con varias formulaciones de la consulta.
-    const variants = [
-        `${raw}, Madrid, España`,
-        `${raw}, Madrid`,
-        raw
-    ];
-    const errors = [];
-
-    for (const q of variants) {
-        try {
-            const r = await routeTryNominatim(q);
-            if (r) { routeState.geocodeCache.set(key, r); routeGeoStoreSave(key, r); return r; }
-        } catch (e) { errors.push(`Nominatim: ${e.message}`); }
-    }
-    for (const q of variants.slice(0, 2)) {
-        try {
-            const r = await routeTryPhoton(q);
-            if (r) { routeState.geocodeCache.set(key, r); routeGeoStoreSave(key, r); return r; }
-        } catch (e) { errors.push(`Photon: ${e.message}`); }
+    const cands = await routeGeocodeCandidates(raw);
+    if (!cands.length) {
+        throw new Error(`No se ha podido localizar «${raw}» dentro del área de Madrid.`
+            + (cands.errors?.length ? ` (${cands.errors.slice(0, 2).join(' / ')})` : '')
+            + ' Prueba con «calle, número, distrito», con un número de parada, o con coordenadas «40.41,-3.70».');
     }
 
-    // 6. Ultimo recurso offline.
-    const local = routeLocalStreetMatch(raw);
-    if (local) { routeState.geocodeCache.set(key, local); return local; }
+    if (routeIsAmbiguous(cands)) throw new RouteAmbiguity(field, raw, cands.slice(0, 6));
 
-    throw new Error(`No se ha podido localizar «${raw}» dentro del área de Madrid.`
-        + (errors.length ? ` (${errors.slice(0, 2).join(' / ')})` : '')
-        + ' Prueba con «calle, número, distrito», con un número de parada, o con coordenadas «40.41,-3.70».');
+    const best = cands[0];
+    routeState.geocodeCache.set(key, best);
+    routeGeoStoreSave(key, best);
+    return best;
 }
 
 function routeUseLocation() {
@@ -3043,7 +3128,7 @@ function routeUseLocation() {
     const btn = $('routeUseLocationBtn'); btn.disabled = true; btn.textContent = '📍 Localizando...';
     navigator.geolocation.getCurrentPosition(pos => {
         $('routeOrigin').value = 'Mi ubicación actual';
-        routeState.routeOriginCoords = { lat: pos.coords.latitude, lon: pos.coords.longitude, label: 'Mi ubicación actual', source: 'gps' };
+        routeState.pinned.origin = { lat: pos.coords.latitude, lon: pos.coords.longitude, label: 'Mi ubicación actual', source: 'gps', text: 'Mi ubicación actual' };
         btn.disabled = false; btn.textContent = '📍 Usar mi ubicación como origen';
     }, () => {
         btn.disabled = false; btn.textContent = '📍 Usar mi ubicación como origen';
@@ -3052,10 +3137,11 @@ function routeUseLocation() {
 }
 
 function routeResolveEndpoint(input, isOrigin = false) {
-    if (isOrigin && routeState.routeOriginCoords && String(input).trim() === 'Mi ubicación actual') {
-        return Promise.resolve(routeState.routeOriginCoords);
-    }
-    return routeGeocode(input);
+    const field = isOrigin ? 'origin' : 'destination';
+    const text = String(input).trim();
+    const pin = routeState.pinned[field];
+    if (pin && pin.text === text) return Promise.resolve(pin);
+    return routeGeocode(text, field);
 }
 
 /* ===== Presentacion =================================================== */
@@ -3146,6 +3232,23 @@ function routeResultHtml(j) {
     </article>`;
 }
 
+function routeChoiceHtml(err) {
+    const campo = err.field === 'origin' ? 'origen' : 'destino';
+    const items = err.candidates.map((c, i) => `
+        <button type="button" class="route-choice" data-choice="${i}">
+            <span class="route-choice-icon">${c.source === 'parada' ? '🚏' : '📍'}</span>
+            <span>
+                <span class="route-choice-title">${escapeHtml(c.short || c.label)}</span>
+                <span class="route-choice-sub">${escapeHtml((c.detail || c.label || '').slice(0, 110))}</span>
+            </span>
+        </button>`).join('');
+    return `<div class="route-choice-card">
+        <strong>¿Cuál de estas es tu ${campo}?</strong>
+        <p>En Madrid hay más de un sitio que encaja con «${escapeHtml(err.text)}». Elige uno y repito la búsqueda.</p>
+        <div class="route-choice-list">${items}</div>
+    </div>`;
+}
+
 function routeWalkOnlyHtml(km) {
     const min = routeWalkingMinutes(km * 1.3);
     return `<article class="route-card">
@@ -3223,8 +3326,28 @@ async function searchRoutes() {
         diagnostics.stopsWithService = routeState.routesByStop.size;
         diagnostics.rounds = ROUTE_MAX_ROUNDS;
 
-        status.innerHTML = `<strong>Origen:</strong> ${escapeHtml(origin.label)}<br><strong>Destino:</strong> ${escapeHtml(destination.label)}`
-            + (origin.approximate || destination.approximate ? '<br><em>Alguno de los puntos es aproximado (localizado por nombre de calle).</em>' : '');
+        status.innerHTML =
+              `<div class="route-point"><span>Origen</span> ${escapeHtml(origin.short || origin.label)}`
+            + `<button type="button" class="route-repick" data-field="origin">cambiar</button></div>`
+            + `<div class="route-point"><span>Destino</span> ${escapeHtml(destination.short || destination.label)}`
+            + `<button type="button" class="route-repick" data-field="destination">cambiar</button></div>`;
+        status.querySelectorAll('.route-repick').forEach(b => b.addEventListener('click', async () => {
+            const field = b.dataset.field;
+            const text = $(field === 'origin' ? 'routeOrigin' : 'routeDestination').value.trim();
+            routeState.pinned[field] = null;
+            routeState.geocodeCache.delete(routeNormalize(text));
+            const cands = await routeGeocodeCandidates(text);
+            if (cands.length < 2) { status.textContent = 'No hay otras coincidencias para ese texto.'; return; }
+            const err = new RouteAmbiguity(field, text, cands.slice(0, 6));
+            routeState.routeToken++;
+            const tk = routeState.routeToken;
+            results.innerHTML = routeChoiceHtml(err);
+            results.querySelectorAll('[data-choice]').forEach(btn => btn.addEventListener('click', () => {
+                if (tk !== routeState.routeToken) return;
+                routeState.pinned[field] = { ...err.candidates[Number(btn.dataset.choice)], text };
+                searchRoutes();
+            }));
+        }));
         results.innerHTML = '<div class="route-loading">Buscando itinerarios en toda la red…</div>';
 
         const straightKm = distanceKm(origin.lat, origin.lon, destination.lat, destination.lon);
@@ -3352,6 +3475,26 @@ async function searchRoutes() {
     } catch (error) {
         if (token !== routeState.routeToken) return;
         diagnostics.ms = Math.round(performance.now() - t0);
+
+        // Ambiguedad: no adivinamos, preguntamos.
+        if (error instanceof RouteAmbiguity) {
+            routeState.pendingChoice = error;
+            $('routeResultsSummary').textContent = 'Elige la dirección correcta';
+            results.innerHTML = routeChoiceHtml(error);
+            results.querySelectorAll('[data-choice]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const c = error.candidates[Number(btn.dataset.choice)];
+                    routeState.pinned[error.field] = { ...c, text: error.text };
+                    const input = $(error.field === 'origin' ? 'routeOrigin' : 'routeDestination');
+                    input.value = error.text;
+                    searchRoutes();
+                });
+            });
+            status.hidden = false;
+            status.textContent = `Hay varias coincidencias para «${error.text}».`;
+            return;
+        }
+
         $('routeResultsSummary').textContent = 'Búsqueda no completada';
         results.innerHTML = `<div class="route-empty"><strong>${escapeHtml(error.message || 'No se han podido calcular las rutas.')}</strong></div>`
             + routeDiagnosticsHtml(diagnostics);
@@ -3366,17 +3509,78 @@ $('routeSearchBtn').addEventListener('click', searchRoutes);
 $('routeSwapBtn').addEventListener('click', () => {
     const a = $('routeOrigin').value, b = $('routeDestination').value;
     $('routeOrigin').value = b; $('routeDestination').value = a;
-    const tmp = routeState.routeOriginCoords;
-    routeState.routeOriginCoords = routeState.routeDestinationCoords;
-    routeState.routeDestinationCoords = tmp;
+    const tmp = routeState.pinned.origin;
+    routeState.pinned.origin = routeState.pinned.destination;
+    routeState.pinned.destination = tmp;
 });
 $('routeUseLocationBtn').addEventListener('click', routeUseLocation);
 $('routeClearBtn').addEventListener('click', () => {
     $('routeOrigin').value = ''; $('routeDestination').value = '';
     $('routeResults').innerHTML = ''; $('routeResultsCard').hidden = true;
-    $('routeGeocodeStatus').hidden = true; routeState.routeOriginCoords = null;
+    $('routeGeocodeStatus').hidden = true;
+    routeState.pinned = { origin: null, destination: null };
+    ['routeOriginSuggest', 'routeDestinationSuggest'].forEach(id => { const el = document.getElementById(id); if (el) el.innerHTML = ''; });
 });
 ['routeOrigin', 'routeDestination'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key === 'Enter') searchRoutes(); }));
+
+/* ===== Sugerencias mientras se escribe ================================
+ * Usamos Photon (rapido, sin limite estricto) + el propio directorio de
+ * paradas EMT. Nominatim se reserva para la busqueda final, respetando su
+ * limite de 1 peticion por segundo.
+ * ===================================================================== */
+function routeAttachSuggestions(inputId, field) {
+    const input = $(inputId);
+    const host = input && (input.closest ? input.closest('.route-input-wrap') : null) || input?.parentElement;
+    if (!input || !host) return;   // si el marcado cambia, no rompemos la app
+    const box = document.createElement('div');
+    box.className = 'route-suggest';
+    box.id = inputId + 'Suggest';
+    host.appendChild(box);
+
+    let timer = null, lastQuery = '';
+
+    const close = () => { box.innerHTML = ''; box.classList.remove('open'); };
+
+    const render = cands => {
+        if (!cands.length) { close(); return; }
+        box.innerHTML = cands.slice(0, 6).map((c, i) => `
+            <button type="button" data-i="${i}">
+                <span class="route-suggest-icon">${c.source === 'parada' ? '🚏' : '📍'}</span>
+                <span><span class="route-suggest-title">${escapeHtml(c.short || c.label)}</span>
+                <span class="route-suggest-sub">${escapeHtml((c.detail || '').slice(0, 90))}</span></span>
+            </button>`).join('');
+        box.classList.add('open');
+        box.querySelectorAll('button').forEach(b => b.addEventListener('mousedown', ev => {
+            ev.preventDefault();
+            const c = cands[Number(b.dataset.i)];
+            input.value = c.short || c.label;
+            routeState.pinned[field] = { ...c, text: input.value };
+            close();
+        }));
+    };
+
+    input.addEventListener('input', () => {
+        // Si el usuario reescribe, el punto fijado deja de valer.
+        if (routeState.pinned[field] && routeState.pinned[field].text !== input.value.trim()) {
+            routeState.pinned[field] = null;
+        }
+        const q = input.value.trim();
+        clearTimeout(timer);
+        if (q.length < 4 || /^\d{1,5}$/.test(q)) { close(); return; }
+        timer = setTimeout(async () => {
+            if (q === lastQuery) return;
+            lastQuery = q;
+            try { render(await routeGeocodeCandidates(q, { quick: true })); }
+            catch { close(); }
+        }, 400);
+    });
+
+    input.addEventListener('blur', () => setTimeout(close, 150));
+    input.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+}
+
+['routeOrigin', 'routeDestination'].forEach(id =>
+    routeAttachSuggestions(id, id === 'routeOrigin' ? 'origin' : 'destination'));
 
 // Precarga en segundo plano: al abrir la pestaña de rutas el CSV ya esta listo.
 setTimeout(() => { routeLoadCsv().catch(() => {}); }, 1200);
@@ -3385,6 +3589,35 @@ setTimeout(() => { routeLoadCsv().catch(() => {}); }, 1200);
 
 <style>
 /* ===== V11 · RUTAS ===== */
+.route-input-wrap { position: relative; }
+.route-suggest { position:absolute; z-index:40; left:0; right:0; top:calc(100% + 6px); display:none; overflow:hidden;
+    border:1px solid var(--border); border-radius:14px; background:var(--panel-solid); box-shadow:var(--shadow); }
+.route-suggest.open { display:block; }
+.route-suggest button { display:grid; grid-template-columns:26px 1fr; gap:9px; align-items:center; width:100%;
+    padding:10px 12px; border:0; border-bottom:1px solid var(--border); background:transparent; color:var(--text); text-align:left; }
+.route-suggest button:last-child { border-bottom:0; }
+.route-suggest button:hover { background:var(--accent-soft); }
+.route-suggest-icon { font-size:15px; }
+.route-suggest-title { display:block; font-size:13px; font-weight:800; }
+.route-suggest-sub { display:block; color:var(--muted); font-size:10px; margin-top:2px; }
+
+.route-choice-card { padding:18px; border:1px solid var(--accent); border-radius:18px; background:var(--panel-solid); }
+.route-choice-card strong { font-size:15px; }
+.route-choice-card p { margin:6px 0 14px; color:var(--muted); font-size:12px; }
+.route-choice-list { display:grid; gap:8px; }
+.route-choice { display:grid; grid-template-columns:30px 1fr; gap:10px; align-items:center; width:100%;
+    padding:12px 13px; border:1px solid var(--border); border-radius:13px; background:var(--panel); color:var(--text); text-align:left; }
+.route-choice:hover { border-color:var(--accent); background:var(--accent-soft); }
+.route-choice-icon { font-size:17px; }
+.route-choice-title { display:block; font-size:13px; font-weight:850; }
+.route-choice-sub { display:block; color:var(--muted); font-size:10px; margin-top:3px; }
+
+.route-point { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12px; margin:3px 0; }
+.route-point > span:first-child { min-width:58px; color:var(--muted); font-weight:850; font-size:10px; text-transform:uppercase; letter-spacing:.07em; }
+.route-repick { padding:2px 8px; border:1px solid var(--border); border-radius:999px; background:transparent; color:var(--accent); font-size:10px; font-weight:800; }
+.route-repick:hover { border-color:var(--accent); }
+
+
 .route-toggle { display:flex; align-items:center; gap:9px; margin:14px 0 4px; color:var(--muted); font-size:12px; cursor:pointer; }
 .route-toggle input { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
 .route-note code { padding:1px 5px; border:1px solid var(--border); border-radius:6px; background:var(--panel-solid); font-size:11px; }
