@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V10.1</title>
+<title>EMT Madrid · V10.2</title>
 
 <style>
 :root {
@@ -975,53 +975,43 @@ pre {
 </style>
 
 <script>
-// ===== CONTADOR DE USUARIOS =====
-// Crea un sitio gratuito en GoatCounter y coloca aquí su código, por ejemplo: "emt-madrid".
-// GoatCounter · contador público de visitas de la demo.
-// El tracking se carga normalmente y el contador visible usa el endpoint
-// público documentado por GoatCounter. Probamos la ruta actual y, como
-// respaldo, la raíz del sitio, porque la página puede registrarse con uno
-// u otro path según la configuración del sitio.
+/* ===== GOATCOUNTER · CONTADOR DE VISITAS DE LA DEMO ===== */
 const GOATCOUNTER_CODE = "emtmadrid";
-if (GOATCOUNTER_CODE) {
+
+(function initGoatCounter() {
+    if (!GOATCOUNTER_CODE) return;
+
     const gcScript = document.createElement("script");
-    gcScript.setAttribute("data-goatcounter", `https://${GOATCOUNTER_CODE}.goatcounter.com/count`);
+    gcScript.setAttribute(
+        "data-goatcounter",
+        `https://${GOATCOUNTER_CODE}.goatcounter.com/count`
+    );
     gcScript.async = true;
     gcScript.src = "https://gc.zgo.at/count.js";
     document.head.appendChild(gcScript);
 
-    const showVisitorCount = async () => {
-        const candidates = [];
-        const currentPath = window.location.pathname || "/";
-        candidates.push(currentPath);
-        if (currentPath !== "/") candidates.push("/");
-
-        for (const path of candidates) {
-            try {
-                const url = `https://${GOATCOUNTER_CODE}.goatcounter.com/counter/${encodeURIComponent(path)}.json`;
-                const response = await fetch(url, {cache:"no-store", mode:"cors"});
-                if (!response.ok) continue;
-                const data = await response.json();
-                if (data && data.count !== undefined) {
-                    $("visitorCount").textContent = data.count;
-                    $("visitorCounter").hidden = false;
-                    return;
-                }
-            } catch (_) {}
-        }
+    // TOTAL evita depender de la URL concreta (?v=...) de la página.
+    // GoatCounter documenta /counter/TOTAL.json como el contador total del sitio.
+    const loadVisitorCount = () => {
+        fetch(`https://${GOATCOUNTER_CODE}.goatcounter.com/counter/TOTAL.json`, {
+            cache: "no-store"
+        })
+        .then(response => response.ok ? response.json() : null)
+        .then(data => {
+            if (!data || data.count == null) return;
+            const el = document.getElementById("visitorCount");
+            const wrap = document.getElementById("visitorCounter");
+            if (!el || !wrap) return;
+            el.textContent = data.count;
+            wrap.hidden = false;
+        })
+        .catch(() => {});
     };
 
-    // count.js debe estar cargado antes de depender de get_data(); esperamos
-    // un poco, pero el contador también puede funcionar con la ruta actual.
-    let attempts = 0;
-    const gcTimer = setInterval(() => {
-        attempts++;
-        if (window.goatcounter?.get_data || attempts >= 25) {
-            clearInterval(gcTimer);
-            showVisitorCount();
-        }
-    }, 200);
-}
+    // El contador público puede tardar unos instantes en estar disponible.
+    setTimeout(loadVisitorCount, 1200);
+    setTimeout(loadVisitorCount, 5000);
+});
 </script>
 </head>
 
@@ -1093,7 +1083,7 @@ if (GOATCOUNTER_CODE) {
     <section class="card routes-hero">
         <div class="routes-kicker">PLANIFICADOR</div>
         <h2 class="home-title">Rutas</h2>
-        <p class="home-subtitle">Indica un origen y un destino para encontrar las alternativas disponibles ahora, con tiempos de llegada EMT, paradas implicadas y transbordos, ordenadas por tiempo.</p>
+        <p class="home-subtitle">Indica un origen y un destino para encontrar las alternativas disponibles ahora, con tiempos de llegada EMT, paradas implicadas y transbordos, priorizando las alternativas realizables desde ahora.</p>
     </section>
 
     <section class="card routes-form-card">
@@ -2927,6 +2917,465 @@ $('routeClearBtn').addEventListener('click',()=>{
 /* ===== V10 · CONTADOR ===== */
 .visitor-counter { display:inline-block; margin-left:10px; padding:5px 9px; border:1px solid var(--border); border-radius:999px; background:var(--panel); }
 </style>
+
+<script>
+/* ===== V10.2 · MOTOR DE RUTAS ROBUSTO =====
+   Objetivo:
+   - No perder destinos lejanos por límites artificiales de paradas por tramo.
+   - Explorar puntos de transbordo reales a lo largo de todo el recorrido.
+   - Permitir reutilizar una misma línea más adelante cuando sea necesario.
+   - Mantener el control del número máximo de transbordos interno (4).
+   - Mantener el límite de 1 km caminando entre correspondencias.
+*/
+
+function routeMultiTransferCandidates(origins, destinations, maxTransfers) {
+    if (maxTransfers <= 2) return [];
+
+    const MAX_STATES_PER_LEVEL = 140;
+    const MAX_TRANSFER_OPTIONS = 20;
+    const MAX_RESULTS_INTERNAL = 160;
+    const MAX_USED_SAME_DIRECTION = 2;
+
+    const destinationIds = new Set(destinations.map(x => String(x.stop.parada)));
+    const transferCache = new Map();
+    const out = [];
+    const seenResults = new Set();
+
+    function getTransfers(stopId) {
+        const key = String(stopId);
+        if (transferCache.has(key)) return transferCache.get(key);
+
+        const options = routeNearbyLineDirections(key, ROUTE_MAX_WALK_KM)
+            .filter(x => x && x.dir && x.transferStop)
+            .sort((a, b) => a.walkKm - b.walkKm)
+            .slice(0, MAX_TRANSFER_OPTIONS);
+
+        transferCache.set(key, options);
+        return options;
+    }
+
+    function distanceToDestination(stop) {
+        if (!stop || !Number.isFinite(stop.lat) || !Number.isFinite(stop.lon)) return Infinity;
+        let best = Infinity;
+        for (const d of destinations) {
+            if (!Number.isFinite(d.stop.lat) || !Number.isFinite(d.stop.lon)) continue;
+            best = Math.min(best, distanceKm(stop.lat, stop.lon, d.stop.lat, d.stop.lon));
+        }
+        return best;
+    }
+
+    function stateCost(s) {
+        const ride = s.segments.reduce((sum, seg) => sum + (seg.rideMin || 0), 0);
+        const walk = routeWalkingMinutes(
+            s.origin.distanceKm + s.transferWalkKm
+        );
+        const targetKm = distanceToDestination(routeStopInfo(s.currentStop));
+        return ride + walk + (s.transfers * 3) + (targetKm * 5);
+    }
+
+    function directionUseCount(pathDirs, key) {
+        return pathDirs.filter(x => x === key).length;
+    }
+
+    let frontier = [];
+
+    for (const o of origins) {
+        for (const start of routeDirectionAtStop(o.stop.parada)) {
+            frontier.push({
+                origin: o,
+                segments: [],
+                dir: start.dir,
+                index: start.index,
+                currentStop: String(o.stop.parada),
+                transferWalks: [],
+                transferWalkKm: 0,
+                transfers: 0,
+                pathStops: [String(o.stop.parada)],
+                pathDirs: [start.dir.key]
+            });
+        }
+    }
+
+    // Una posición de partida por recorrido/dirección.
+    const initialSeen = new Set();
+    frontier = frontier.filter(state => {
+        const key = `${state.dir.key}|${state.index}|${state.currentStop}`;
+        if (initialSeen.has(key)) return false;
+        initialSeen.add(key);
+        return true;
+    });
+
+    for (let depth = 0; depth < maxTransfers && frontier.length; depth++) {
+        frontier.sort((a, b) => stateCost(a) - stateCost(b));
+        frontier = frontier.slice(0, MAX_STATES_PER_LEVEL);
+
+        const nextStates = [];
+        const levelSeen = new Set();
+
+        for (const state of frontier) {
+            // IMPORTANTE: recorremos TODAS las paradas restantes de la dirección.
+            // No existe el antiguo +80 que podía cortar una ruta válida antes del destino.
+            for (let i = state.index + 1; i < state.dir.stops.length; i++) {
+                const sid = String(state.dir.stops[i].parada);
+                const transferStop = routeStopInfo(sid);
+                if (!transferStop) continue;
+
+                // ¿Desde este punto podemos llegar al destino sin otro transbordo?
+                for (const d of destinations) {
+                    const idxDest = state.dir.indexByStop.get(String(d.stop.parada));
+                    if (idxDest === undefined || idxDest <= i) continue;
+
+                    const finalSeg = routeSegment(
+                        state.dir,
+                        state.currentStop,
+                        state.index,
+                        d.stop.parada,
+                        idxDest,
+                        0
+                    );
+
+                    const candidate = {
+                        transfers: state.transfers,
+                        walkStart: state.origin.distanceKm,
+                        walkEnd: d.distanceKm,
+                        segments: state.segments.concat(finalSeg),
+                        transferWalkKm: state.transferWalkKm,
+                        transferWalks: state.transferWalks.slice()
+                    };
+
+                    const sig = candidate.segments
+                        .map(x => `${x.line}|${x.sentido}|${x.boardStop}|${x.alightStop}`)
+                        .join(">");
+
+                    if (!seenResults.has(sig)) {
+                        seenResults.add(sig);
+                        out.push(candidate);
+                        if (out.length >= MAX_RESULTS_INTERNAL) break;
+                    }
+                }
+
+                if (out.length >= MAX_RESULTS_INTERNAL) break;
+                if (state.transfers + 1 > maxTransfers) continue;
+
+                // Solo expandimos en paradas donde realmente existe otra línea
+                // a <= 1 km, o sea, puntos con capacidad real de correspondencia.
+                const options = getTransfers(sid);
+
+                for (const next of options) {
+                    const nextKey = next.dir.key;
+                    const currentLine = normalizeLine(state.dir.line);
+                    const nextLine = normalizeLine(next.dir.line);
+
+                    if (nextLine === currentLine) continue;
+                    if (next.index >= next.dir.stops.length - 1) continue;
+
+                    // Permitimos reutilizar un recorrido más adelante, pero no
+                    // infinitamente: máximo 2 usos de la misma dirección.
+                    if (directionUseCount(state.pathDirs, nextKey) >= MAX_USED_SAME_DIRECTION) continue;
+
+                    // No volver a una parada que ya forma parte del itinerario.
+                    if (state.pathStops.includes(String(next.transferStop.parada))) continue;
+
+                    const segment = routeSegment(
+                        state.dir,
+                        state.currentStop,
+                        state.index,
+                        sid,
+                        i,
+                        0
+                    );
+
+                    const nextState = {
+                        origin: state.origin,
+                        segments: state.segments.concat(segment),
+                        dir: next.dir,
+                        index: next.index,
+                        currentStop: String(next.transferStop.parada),
+                        transferWalks: state.transferWalks.concat(next.walkKm),
+                        transferWalkKm: state.transferWalkKm + next.walkKm,
+                        transfers: state.transfers + 1,
+                        pathStops: state.pathStops.concat(sid),
+                        pathDirs: state.pathDirs.concat(nextKey)
+                    };
+
+                    const key = `${nextKey}|${next.index}|${nextState.currentStop}|${nextState.transfers}|${nextState.pathDirs.join(",")}`;
+                    if (levelSeen.has(key)) continue;
+
+                    levelSeen.add(key);
+                    nextStates.push(nextState);
+                }
+
+                // Mantener el hilo principal ligero.
+                if ((i - state.index) % 80 === 0) {
+                    // El yield real se produce por nivel; aquí simplemente
+                    // evitamos crear trabajo innecesario en una misma rama.
+                }
+            }
+        }
+
+        if (out.length >= MAX_RESULTS_INTERNAL) break;
+
+        nextStates.sort((a, b) => stateCost(a) - stateCost(b));
+        frontier = nextStates.slice(0, MAX_STATES_PER_LEVEL);
+    }
+
+    return out.slice(0, MAX_RESULTS_INTERNAL);
+}
+
+
+/* ===== V10.2 · GEOCODIFICACIÓN CON NÚMERO DE PORTAL =====
+   Preferimos resultados de Nominatim que realmente conserven el número.
+   Si no existe coincidencia exacta, usamos el mejor resultado de la calle.
+*/
+async function routeGeocode(input) {
+    const raw = String(input || "").trim();
+
+    // Solo un número puro o "parada 1234" es una parada EMT.
+    const stopMatch = raw.match(/^(?:parada\s*)?(\d{1,5})$/i);
+    if (stopMatch) {
+        const s = routeStopInfo(stopMatch[1]);
+        if (s) {
+            return {
+                lat: s.lat,
+                lon: s.lon,
+                label: `Parada ${s.parada} · ${s.nombre}`,
+                stop: s
+            };
+        }
+    }
+
+    const key = routeNormalize(raw);
+    if (routeState.geocodeCache.has(key)) {
+        return routeState.geocodeCache.get(key);
+    }
+
+    const portalMatch = raw.match(/\b(\d{1,4})\b\s*$/);
+    const requestedNumber = portalMatch ? portalMatch[1] : null;
+
+    const queries = requestedNumber
+        ? [
+            `${raw}, Madrid`,
+            `${raw}, Madrid, España`,
+            `${raw.split(/\s+\d{1,4}\s*$/)[0]}, Madrid`
+        ]
+        : [`${raw}, Madrid`];
+
+    let best = null;
+
+    for (const query of queries) {
+        const url =
+            `https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1` +
+            `&zoom=18&limit=5&countrycodes=es&accept-language=es&q=${encodeURIComponent(query)}`;
+
+        const response = await fetch(url, {
+            headers: { "Accept": "application/json" },
+            cache: "no-store"
+        });
+
+        if (!response.ok) continue;
+
+        const data = await response.json();
+        if (!Array.isArray(data) || !data.length) continue;
+
+        for (const candidate of data) {
+            const address = candidate.address || {};
+            const candidateNumber = String(address.house_number || "");
+
+            // Preferencia fuerte por el número solicitado.
+            if (requestedNumber && candidateNumber === requestedNumber) {
+                best = candidate;
+                break;
+            }
+
+            if (!best) best = candidate;
+        }
+
+        if (best && (!requestedNumber || String(best.address?.house_number || "") === requestedNumber)) {
+            break;
+        }
+    }
+
+    if (!best) {
+        throw new Error(`No se ha encontrado «${raw}».`);
+    }
+
+    const result = {
+        lat: Number(best.lat),
+        lon: Number(best.lon),
+        // Conservamos SIEMPRE lo que introdujo el usuario para que no parezca
+        // que el número desapareció aunque Nominatim devuelva el centro de la calle.
+        label: requestedNumber
+            ? `${raw} · ${best.display_name}`
+            : best.display_name,
+        stop: null,
+        geocodedHouseNumber: best.address?.house_number || null
+    };
+
+    routeState.geocodeCache.set(key, result);
+    return result;
+}
+
+
+/* ===== V10.2 · SIMULACIÓN LIVE MÁS TOLERANTE =====
+   En una conexión de transbordo, si PMV no ofrece todavía una estimación para
+   el siguiente tramo, no descartamos automáticamente toda la ruta. La ruta
+   se marca como pendiente de confirmación y se utiliza una penalización
+   conservadora para poder seguir comparando alternativas.
+*/
+async function routeApplyLiveTimes(candidates) {
+    const stopIds = [...new Set(
+        candidates.flatMap(c => c.segments.map(s => String(s.boardStop)))
+    )];
+
+    const cache = new Map();
+
+    // Un máximo razonable de consultas por búsqueda.
+    for (const id of stopIds.slice(0, 40)) {
+        try {
+            cache.set(id, await routeFetchPMV(id));
+        } catch (e) {
+            cache.set(id, { estimaciones: [], error: e.message });
+        }
+        await new Promise(resolve => setTimeout(resolve, 35));
+    }
+
+    const valid = [];
+    const now = new Date();
+    const nowMinutes =
+        now.getHours() * 60 +
+        now.getMinutes() +
+        now.getSeconds() / 60;
+
+    for (const c of candidates) {
+        let elapsed = routeWalkingMinutes(c.walkStart);
+        let feasible = true;
+        let firstWait = null;
+        let firstDepartureClock = null;
+        let liveConfirmed = true;
+
+        for (let i = 0; i < c.segments.length; i++) {
+            const seg = c.segments[i];
+            const data = cache.get(String(seg.boardStop));
+
+            let arr = (data?.estimaciones || [])
+                .filter(x => normalizeLine(x.linea) === normalizeLine(seg.line))
+                .filter(x => Number.isFinite(x.minutos));
+
+            if (!arr.length) {
+                // En el primer tramo necesitamos una salida real.
+                // En tramos posteriores toleramos falta de dato, pero no fingimos
+                // que haya llegado.
+                if (i === 0) {
+                    feasible = false;
+                    break;
+                }
+
+                liveConfirmed = false;
+                seg.live = null;
+                seg.waitMin = 0;
+                seg.liveDestination = seg.terminal;
+                elapsed += seg.rideMin;
+                if (i < c.segments.length - 1) {
+                    elapsed += routeWalkingMinutes((c.transferWalks || [])[i] || 0);
+                }
+                continue;
+            }
+
+            const matching = arr.filter(x => routeMatchLiveDirection(x, seg.terminal));
+            if (matching.length) arr = matching;
+
+            const possible = arr
+                .filter(x => x.minutos + 0.25 >= elapsed)
+                .sort((a, b) => a.minutos - b.minutos);
+
+            const best = possible[0];
+
+            if (!best) {
+                if (i === 0) {
+                    feasible = false;
+                    break;
+                }
+
+                liveConfirmed = false;
+                seg.live = null;
+                seg.waitMin = 0;
+                seg.liveDestination = seg.terminal;
+            } else {
+                const wait = Math.max(0, best.minutos - elapsed);
+
+                if (i === 0) {
+                    firstWait = best.minutos;
+                    firstDepartureClock = nowMinutes + best.minutos;
+                }
+
+                seg.live = best;
+                seg.waitMin = wait;
+                seg.liveDestination = best.destino || seg.terminal;
+                seg.liveStatus = best.minutos <= 1
+                    ? "ahora"
+                    : `en ${Math.round(best.minutos)} min`;
+
+                elapsed += wait;
+            }
+
+            elapsed += seg.rideMin;
+
+            if (i < c.segments.length - 1) {
+                elapsed += routeWalkingMinutes((c.transferWalks || [])[i] || 0);
+            }
+        }
+
+        if (!feasible) continue;
+
+        elapsed += routeWalkingMinutes(c.walkEnd);
+
+        c.firstDepartureMin = firstWait;
+        c.firstDepartureClock = firstDepartureClock;
+        c.liveConfirmed = liveConfirmed;
+        c.totalMin = Math.max(1, Math.ceil(elapsed));
+        c.liveDirectionMismatch = false;
+        c.liveCheckedAt = new Date().toISOString();
+        valid.push(c);
+    }
+
+    return valid;
+}
+
+
+/* ===== V10.2 · TEXTO DEL RESULTADO ===== */
+const _routeResultHtmlV102 = routeResultHtml;
+routeResultHtml = function(c, index) {
+    const html = _routeResultHtmlV102(c, index);
+    if (!c.liveConfirmed) {
+        return html.replace(
+            '</article>',
+            '<div class="route-live-pending">ℹ️ Uno de los tramos no tiene todavía una estimación EMT confirmable; el tiempo de ese tramo es orientativo.</div></article>'
+        );
+    }
+    return html;
+};
+
+
+/* ===== V10.2 · OBSERVABILIDAD ===== */
+window.EMT_ROUTE_V102 = {
+    version: "10.2",
+    autoMaxTransfers: ROUTE_AUTO_MAX_TRANSFERS
+};
+</script>
+
+
+<style>
+.route-live-pending {
+    margin: 0 16px 16px;
+    padding: 9px 11px;
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.4;
+}
+</style>
+
 </body>
 </html>
 
