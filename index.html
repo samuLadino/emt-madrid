@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V11.3</title>
+<title>EMT Madrid · V11.4</title>
 
 <style>
 :root {
@@ -1122,7 +1122,7 @@ if (GOATCOUNTER_CODE) {
             <input type="checkbox" id="routeOnlyLive">
             <span>Mostrar solo itinerarios con la primera salida confirmada por EMT</span>
         </label>
-        <p class="route-note">V11.3: las direcciones se resuelven con <strong>CartoCiudad</strong> (geocodificador oficial del IGN), Photon y Nominatim. Si hay m&aacute;s de un sitio posible <strong>siempre pregunta</strong>, con enlace al mapa de cada opci&oacute;n, y puedes fijar el punto a mano con coordenadas o con un n&uacute;mero de parada. Junto al origen y al destino tienes un bot&oacute;n <em>cambiar</em> que abre ese selector cuando quieras. El itinerario se calcula con RAPTOR sobre toda la red EMT.</p>
+        <p class="route-note">V11.4: para cada direcci&oacute;n se consulta <strong>CartoCiudad</strong> (IGN) <em>con y sin</em> n&uacute;mero de portal, m&aacute;s Photon y Nominatim. La consulta sin portal es la que descubre que en Madrid hay <strong>varias calles con el mismo nombre</strong> en barrios distintos; cuando eso pasa el desplegable lo avisa y la app te deja elegir, con enlace al mapa. Siempre puedes fijar el punto a mano con coordenadas o con un n&uacute;mero de parada. El itinerario se calcula con RAPTOR sobre toda la red EMT.</p>
         <div class="route-geocode-status" id="routeGeocodeStatus" hidden></div>
     </section>
 
@@ -2951,6 +2951,7 @@ function routeCartoMap(c, want) {
         lat, lon, source: 'cartociudad',
         type: c.type, category: 'address', importance: 0.2,
         portalExacto: want.numero ? String(c.portalNumber ?? '') === String(want.numero) : false,
+        nivelCalle: c.portalNumber == null || c.portalNumber === '',
         name: c.address,
         address: {
             road: c.address,
@@ -2973,17 +2974,25 @@ function routeCartoMap(c, want) {
 async function routeCartoCiudad(want) {
     const viaCorta = want.via.replace(/^(calle|c\/|avenida|avda|av\.?|paseo|plaza|pza\.?|glorieta|gta\.?|ronda|camino|travesia|travesía)\s+/i, '');
     const n = want.numero;
-    const consultas = [
-        n ? `${want.via}, ${n}, Madrid` : `${want.via}, Madrid`,
-        n ? `${viaCorta}, ${n}, Madrid` : `${viaCorta}, Madrid`,
-        n ? `${viaCorta} ${n}, Madrid, Madrid` : `${viaCorta}, Madrid, Madrid`
-    ].filter((v, i, a) => a.indexOf(v) === i);
+    // CLAVE: con el numero de portal, CartoCiudad devuelve UN unico portal
+    // "el mejor". Sin numero devuelve una entrada por CADA via con ese
+    // nombre en el municipio, que es justo lo que necesitamos para detectar
+    // que en Madrid hay dos "Calle del Aire" en barrios distintos.
+    const consultas = [];
+    if (n) {
+        consultas.push(`${want.via}, ${n}, Madrid`);
+        consultas.push(`${viaCorta}, ${n}, Madrid`);
+    }
+    consultas.push(`${want.via}, Madrid`);
+    consultas.push(`${viaCorta}, Madrid`);
+    const vistasConsultas = new Set();
+    const consultasUnicas = consultas.filter(q => { const k = q.toUpperCase(); if (vistasConsultas.has(k)) return false; vistasConsultas.add(k); return true; });
 
     const out = [];
     const vistos = new Set();
     const errores = [];
 
-    for (const q of consultas) {
+    for (const q of consultasUnicas) {
         const url = `https://www.cartociudad.es/geocoder/api/geocoder/candidatesJsonp?q=${encodeURIComponent(q)}&limit=15&countryCode=011`;
         try {
             const data = await routeJsonp(url, { timeout: 7000 });
@@ -3036,6 +3045,10 @@ function routeCandidateShort(item) {
     const zona = a.suburb || a.quarter || a.city_district || a.district || '';
     const muni = a.city || a.town || a.village || a.municipality || '';
     const cp = a.postcode ? `CP ${a.postcode}` : '';
+    if (item.nivelCalle) {
+        const base = [a.road || item.name || '', a.suburb || '', a.city || '', cp].filter(Boolean).join(' · ');
+        return `${base} (calle completa, sin portal)`;
+    }
     // El codigo postal es lo unico que distingue dos portales homonimos
     // dentro del mismo municipio, asi que nunca lo omitimos.
     const partes = [`${via}${num}`.trim(), zona, muni, cp].filter((v, i, arr) => v && arr.indexOf(v) === i);
@@ -3058,6 +3071,7 @@ function routeScoreCandidate(c, want) {
     score += Math.min(1.5, Number(c.importance || 0) * 3);
     if (c.source === 'cartociudad') score += 1.5;      // fuente oficial española
     if (c.portalExacto) score += 2;
+    if (c.nivelCalle) score -= 1.2;   // sirve para detectar homonimas, pero es menos preciso
     if (c.source === 'photon') score -= 0.3;
     return score;
 }
@@ -3143,7 +3157,9 @@ async function routeGeocodeCandidates(raw, { quick = false } = {}) {
                 label: item.display_name || routeCandidateShort(item),
                 short: routeCandidateShort(item),
                 detail: item.display_name || '',
-                address: item.address
+                address: item.address,
+                nivelCalle: !!item.nivelCalle,
+                portalExacto: !!item.portalExacto
             });
         }
     };
@@ -3157,10 +3173,10 @@ async function routeGeocodeCandidates(raw, { quick = false } = {}) {
     if (!quick) {
         try { collect(await routeNominatimStructured(want)); }
         catch (e) { errors.push(`Nominatim: ${e.message}`); }
-        if (results.length < 3) {
-            try { collect(await routeNominatimFree(`${raw}, Madrid, España`)); }
-            catch (e) { errors.push(`Nominatim: ${e.message}`); }
-        }
+        // Sin numero: lista TODAS las vias homonimas del area, que es lo que
+        // permite descubrir la segunda "Calle del Aire".
+        try { collect(await routeNominatimFree(`${want.via}, Madrid`)); }
+        catch (e) { errors.push(`Nominatim: ${e.message}`); }
     }
 
     // Fusion: dos resultados a menos de 150 m son el mismo sitio.
@@ -3533,8 +3549,29 @@ async function searchRoutes() {
 
         const straightKm = distanceKm(origin.lat, origin.lon, destination.lat, destination.lon);
         if (straightKm > 12) {
-            status.innerHTML += `<div class="route-warn">⚠️ Origen y destino están a ${routeFormatKm(straightKm)} en línea recta. `
-                + `Si no es lo que esperabas, pulsa <strong>cambiar</strong> para revisar la dirección.</div>`;
+            // No basta con decir "pulsa cambiar": ponemos las alternativas
+            // reales aqui mismo, a un clic.
+            const alt = [];
+            for (const f of ['origin', 'destination']) {
+                const elegido = f === 'origin' ? origin : destination;
+                for (const c of (routeState.lastCandidates[f] || [])) {
+                    if (distanceKm(c.lat, c.lon, elegido.lat, elegido.lon) < 0.35) continue;
+                    alt.push({ field: f, cand: c });
+                }
+            }
+            const botones = alt.slice(0, 4).map((a, i) =>
+                `<button type="button" class="route-alt" data-alt="${i}">${a.field === 'origin' ? 'Origen' : 'Destino'}: ${escapeHtml(a.cand.short || a.cand.label)}</button>`).join('');
+            status.innerHTML += `<div class="route-warn">⚠️ Origen y destino están a ${routeFormatKm(straightKm)} en línea recta.`
+                + (botones
+                    ? `<div class="route-alt-intro">¿Querías alguna de estas?</div><div class="route-alt-list">${botones}</div>`
+                    : ' Si no es lo que esperabas, pulsa <strong>cambiar</strong> para revisar la dirección.')
+                + `</div>`;
+            status.querySelectorAll('.route-alt').forEach(b => b.addEventListener('click', () => {
+                const a = alt[Number(b.dataset.alt)];
+                const texto = $(a.field === 'origin' ? 'routeOrigin' : 'routeDestination').value.trim();
+                routeState.pinned[a.field] = { ...a.cand, text: texto };
+                searchRoutes();
+            }));
         }
 
         // Preferencia de red segun la hora, pero SIN excluir nada:
@@ -3726,12 +3763,18 @@ function routeAttachSuggestions(inputId, field) {
 
     const render = cands => {
         if (!cands.length) { close(); return; }
+        // Guardamos la lista para que "cambiar" y el diagnostico la vean
+        // aunque el usuario elija desde el desplegable.
+        routeState.lastCandidates[field] = cands.slice(0, 8);
         box.innerHTML = cands.slice(0, 6).map((c, i) => `
             <button type="button" data-i="${i}">
                 <span class="route-suggest-icon">${c.source === 'parada' ? '🚏' : '📍'}</span>
                 <span><span class="route-suggest-title">${escapeHtml(c.short || c.label)}</span>
                 <span class="route-suggest-sub">${escapeHtml((c.detail || '').slice(0, 90))}</span></span>
             </button>`).join('');
+        const lejos = cands.slice(1).some(c => distanceKm(cands[0].lat, cands[0].lon, c.lat, c.lon) > 0.35);
+        if (lejos) box.insertAdjacentHTML('afterbegin',
+            '<div class="route-suggest-warn">⚠️ Hay varias direcciones con ese nombre en Madrid. Fíjate en el barrio y el CP.</div>');
         box.classList.add('open');
         box.querySelectorAll('button').forEach(b => b.addEventListener('mousedown', ev => {
             ev.preventDefault();
@@ -3753,12 +3796,21 @@ function routeAttachSuggestions(inputId, field) {
         timer = setTimeout(async () => {
             if (q === lastQuery) return;
             lastQuery = q;
-            try { render(await routeGeocodeCandidates(q, { quick: true })); }
-            catch { close(); }
-        }, 400);
+            try {
+                // Primero lo rapido (CartoCiudad + Photon) para que el
+                // desplegable aparezca ya, y despues se completa con
+                // Nominatim, que es quien suele conocer las homonimas.
+                const rapidos = await routeGeocodeCandidates(q, { quick: true });
+                if (input.value.trim() !== q) return;
+                render(rapidos);
+                const completos = await routeGeocodeCandidates(q);
+                if (input.value.trim() !== q) return;
+                render(completos);
+            } catch { close(); }
+        }, 500);
     });
 
-    input.addEventListener('blur', () => setTimeout(close, 150));
+    input.addEventListener('blur', () => setTimeout(close, 200));
     input.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
 }
 
@@ -3772,6 +3824,11 @@ setTimeout(() => { routeLoadCsv().catch(() => {}); }, 1200);
 
 <style>
 /* ===== V11 · RUTAS ===== */
+.route-suggest-warn { padding:9px 12px; border-bottom:1px solid var(--border); background:var(--accent-soft); color:var(--warning); font-size:10px; font-weight:800; }
+.route-alt-intro { margin-top:9px; font-weight:850; }
+.route-alt-list { display:grid; gap:6px; margin-top:8px; }
+.route-alt { padding:9px 11px; border:1px solid var(--warning); border-radius:11px; background:var(--panel-solid); color:var(--text); text-align:left; font-size:11px; font-weight:700; }
+.route-alt:hover { background:var(--accent-soft); border-color:var(--accent); }
 .route-choice-row { display:grid; grid-template-columns:1fr 42px; gap:7px; align-items:stretch; }
 .route-choice-map { display:grid; place-items:center; border:1px solid var(--border); border-radius:13px; background:var(--panel); text-decoration:none; font-size:17px; }
 .route-choice-map:hover { border-color:var(--accent); background:var(--accent-soft); }
