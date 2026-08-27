@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V10.2</title>
+<title>EMT Madrid · V10.3</title>
 
 <style>
 :root {
@@ -975,7 +975,7 @@ pre {
 </style>
 
 <script>
-/* ===== GOATCOUNTER · CONTADOR DE VISITAS DE LA DEMO ===== */
+/* ===== GOATCOUNTER · CONTADOR DE VISITAS ===== */
 const GOATCOUNTER_CODE = "emtmadrid";
 
 (function initGoatCounter() {
@@ -990,28 +990,28 @@ const GOATCOUNTER_CODE = "emtmadrid";
     gcScript.src = "https://gc.zgo.at/count.js";
     document.head.appendChild(gcScript);
 
-    // TOTAL evita depender de la URL concreta (?v=...) de la página.
-    // GoatCounter documenta /counter/TOTAL.json como el contador total del sitio.
-    const loadVisitorCount = () => {
-        fetch(`https://${GOATCOUNTER_CODE}.goatcounter.com/counter/TOTAL.json`, {
-            cache: "no-store"
-        })
-        .then(response => response.ok ? response.json() : null)
-        .then(data => {
-            if (!data || data.count == null) return;
-            const el = document.getElementById("visitorCount");
-            const wrap = document.getElementById("visitorCounter");
-            if (!el || !wrap) return;
-            el.textContent = data.count;
-            wrap.hidden = false;
-        })
-        .catch(() => {});
-    };
+    function showGoatCounterTotal() {
+        if (!window.goatcounter?.visit_count) return false;
 
-    // El contador público puede tardar unos instantes en estar disponible.
-    setTimeout(loadVisitorCount, 1200);
-    setTimeout(loadVisitorCount, 5000);
-});
+        const holder = document.getElementById("visitorCounter");
+        if (!holder) return true;
+
+        // TOTAL es el acumulado de visitas de todo el sitio.
+        window.goatcounter.visit_count({
+            path: "TOTAL",
+            append: "#visitorCounter",
+            no_branding: true
+        });
+
+        return true;
+    }
+
+    const timer = setInterval(() => {
+        if (showGoatCounterTotal()) clearInterval(timer);
+    }, 100);
+
+    setTimeout(() => clearInterval(timer), 10000);
+})();
 </script>
 </head>
 
@@ -1211,7 +1211,7 @@ const GOATCOUNTER_CODE = "emtmadrid";
 
 <div class="footer">
     Datos obtenidos directamente de EMT
-    <span id="visitorCounter" class="visitor-counter" hidden>👁️ Visitas a la demo: <strong id="visitorCount">—</strong></span>
+    <span id="visitorCounter" class="visitor-counter" aria-live="polite">👁️ Visitas a la demo: <span id="visitorCount">…</span></span>
 </div>
 
 </div>
@@ -2915,7 +2915,7 @@ $('routeClearBtn').addEventListener('click',()=>{
 
 <style>
 /* ===== V10 · CONTADOR ===== */
-.visitor-counter { display:inline-block; margin-left:10px; padding:5px 9px; border:1px solid var(--border); border-radius:999px; background:var(--panel); }
+.visitor-counter { display:inline-flex; align-items:center; gap:4px; margin-left:10px; padding:5px 9px; border:1px solid var(--border); border-radius:999px; background:var(--panel); }
 </style>
 
 <script>
@@ -3375,6 +3375,386 @@ window.EMT_ROUTE_V102 = {
     line-height: 1.4;
 }
 </style>
+
+
+<script>
+/* ===== V10.3 · ÍNDICE COMPLETO DE PARADAS DEL CSV =====
+   Motivo: algunas paradas válidas (por ejemplo 5844) pueden no estar en el
+   directorio embebido utilizado por la UI. Para Rutas, el CSV es la fuente
+   completa de recorridos y coordenadas.
+*/
+
+routeState.csvStops = new Map();
+routeState.allRouteStops = [];
+
+function utm30ToWgs84(easting, northing) {
+    const a = 6378137;
+    const eccSquared = 0.00669438;
+    const k0 = 0.9996;
+    const zone = 30;
+    const lonOrigin = (zone - 1) * 6 - 180 + 3;
+
+    const x = Number(easting) - 500000;
+    let y = Number(northing);
+
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+
+    const e1 = (1 - Math.sqrt(1 - eccSquared)) / (1 + Math.sqrt(1 - eccSquared));
+    const M = y / k0;
+    const mu = M / (a * (1 - eccSquared / 4 - 3 * eccSquared * eccSquared / 64));
+
+    const phi1Rad =
+        mu
+        + (3 * e1 / 2 - 27 * Math.pow(e1, 3) / 32) * Math.sin(2 * mu)
+        + (21 * e1 * e1 / 16 - 55 * Math.pow(e1, 4) / 32) * Math.sin(4 * mu)
+        + (151 * Math.pow(e1, 3) / 96) * Math.sin(6 * mu)
+        + (1097 * Math.pow(e1, 4) / 512) * Math.sin(8 * mu);
+
+    const eccPrimeSquared = eccSquared / (1 - eccSquared);
+    const N1 = a / Math.sqrt(1 - eccSquared * Math.sin(phi1Rad) ** 2);
+    const T1 = Math.tan(phi1Rad) ** 2;
+    const C1 = eccPrimeSquared * Math.cos(phi1Rad) ** 2;
+    const R1 = a * (1 - eccSquared) /
+        Math.pow(1 - eccSquared * Math.sin(phi1Rad) ** 2, 1.5);
+    const D = x / (N1 * k0);
+
+    const lat =
+        phi1Rad -
+        (N1 * Math.tan(phi1Rad) / R1) *
+        (
+            D * D / 2 -
+            (5 + 3 * T1 + 10 * C1 - 4 * C1 * C1 - 9 * eccPrimeSquared) *
+            Math.pow(D, 4) / 24 +
+            (61 + 90 * T1 + 298 * C1 + 45 * T1 * T1 -
+            252 * eccPrimeSquared - 3 * C1 * C1) *
+            Math.pow(D, 6) / 720
+        );
+
+    const lon =
+        lonOrigin +
+        (
+            D -
+            (1 + 2 * T1 + C1) * Math.pow(D, 3) / 6 +
+            (5 - 2 * C1 + 28 * T1 - 3 * C1 * C1 +
+            8 * eccPrimeSquared + 24 * T1 * T1) *
+            Math.pow(D, 5) / 120
+        ) / Math.cos(phi1Rad) * 180 / Math.PI;
+
+    return {
+        lat: lat * 180 / Math.PI,
+        lon
+    };
+}
+
+async function routeLoadCsvWithCompleteStops() {
+    await routeLoadCsv();
+
+    if (routeState.csvStopsLoaded) return;
+
+    const response = await fetch("./stopsemt.csv", {
+        cache: "no-store"
+    });
+    if (!response.ok) throw new Error(`No se pudo cargar stopsemt.csv (HTTP ${response.status})`);
+
+    const text = await response.text();
+    const rows = routeCsvParse(text).filter(r => r.some(v => String(v || "").trim() !== ""));
+    const headers = rows.shift().map(x => x.replace(/^\uFEFF/, "").trim());
+    const idx = Object.fromEntries(headers.map((h, i) => [h, i]));
+
+    // Utilizamos exactamente el mismo criterio de vigencia que el cargador de rutas.
+    const csvDateKey = value => {
+        const raw = String(value || "").trim();
+        if (!raw) return "";
+        let m = raw.match(/^(\d{2})[\/-](\d{2})[\/-](\d{4})/);
+        if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+        m = raw.match(/^(\d{4})[\/-](\d{2})[\/-](\d{2})/);
+        return m ? `${m[1]}-${m[2]}-${m[3]}` : "";
+    };
+
+    const now = new Date();
+    const todayKey =
+        `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+
+    for (const r of rows) {
+        const dateIni = csvDateKey(r[idx.dateIni]);
+        const dateEnd = csvDateKey(r[idx.dateEnd]);
+
+        if (dateIni && dateIni > todayKey) continue;
+        if (dateEnd && dateEnd < todayKey) continue;
+
+        const id = String(r[idx.parada] || "").trim();
+        if (!id) continue;
+
+        const easting = routeCsvNumber(r[idx.posX]);
+        const northing = routeCsvNumber(r[idx.posY]);
+        const coords = utm30ToWgs84(easting, northing);
+        if (!coords) continue;
+
+        const stop = {
+            parada: id,
+            nombre: cleanText(r[idx.descparada] || ""),
+            direccion: cleanText(r[idx.descpostal] || ""),
+            lat: coords.lat,
+            lon: coords.lon,
+            label: cleanText(r[idx.label] || ""),
+            line: cleanText(r[idx.line] || "")
+        };
+
+        // Una parada puede aparecer en muchos recorridos. Solo necesitamos
+        // una coordenada/nombre representativos.
+        if (!routeState.csvStops.has(id)) {
+            routeState.csvStops.set(id, stop);
+        }
+    }
+
+    // Primero el índice completo del CSV y después cualquier parada embebida
+    // que no haya aparecido en el CSV activo.
+    const merged = new Map(routeState.csvStops);
+    for (const s of STOP_DIRECTORY) {
+        if (!merged.has(String(s.parada))) {
+            merged.set(String(s.parada), s);
+        }
+    }
+
+    routeState.allRouteStops = [...merged.values()].filter(
+        s => Number.isFinite(s.lat) && Number.isFinite(s.lon)
+    );
+
+    for (const s of routeState.allRouteStops) {
+        routeState.stopById.set(String(s.parada), s);
+    }
+
+    routeState.csvStopsLoaded = true;
+}
+
+// La nueva versión del cargador se utiliza en las búsquedas.
+routeLoadCsv = routeLoadCsvWithCompleteStops;
+
+// El índice completo evita depender del directorio embebido para las paradas
+// que existen únicamente en el CSV.
+routeStopInfo = function(id) {
+    const key = String(id);
+    if (routeState.stopById.has(key)) return routeState.stopById.get(key);
+    if (routeState.csvStops?.has(key)) {
+        const s = routeState.csvStops.get(key);
+        routeState.stopById.set(key, s);
+        return s;
+    }
+    return null;
+};
+
+routeNearbyStops = function(lat, lon, radiusKm = 1, limit = 30) {
+    const candidates = [];
+    const source = routeState.allRouteStops?.length
+        ? routeState.allRouteStops
+        : STOP_DIRECTORY;
+
+    for (const stop of source) {
+        if (!Number.isFinite(stop.lat) || !Number.isFinite(stop.lon)) continue;
+        const d = distanceKm(lat, lon, stop.lat, stop.lon);
+        if (d <= radiusKm) {
+            candidates.push({ stop, distanceKm: d });
+        }
+    }
+
+    candidates.sort((a, b) => a.distanceKm - b.distanceKm);
+
+    const seen = new Set();
+    return candidates.filter(item => {
+        const id = String(item.stop.parada);
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return true;
+    }).slice(0, limit);
+};
+
+
+/* ===== V10.3 · CONSULTA LIVE MÁS ROBUSTA =====
+   Consultamos en paralelo con límite de concurrencia para no bloquear la
+   aplicación y para no perder candidatos porque el conjunto de paradas de
+   subida sea >40.
+*/
+async function routeApplyLiveTimes(candidates) {
+    const stopIds = [...new Set(
+        candidates.flatMap(c => c.segments.map(s => String(s.boardStop)))
+    )];
+
+    const cache = new Map();
+    const concurrency = 6;
+    let cursor = 0;
+
+    async function worker() {
+        while (true) {
+            const index = cursor++;
+            if (index >= stopIds.length) return;
+
+            const id = stopIds[index];
+
+            try {
+                cache.set(id, await routeFetchPMV(id));
+            } catch (e) {
+                cache.set(id, { estimaciones: [], error: e.message });
+            }
+        }
+    }
+
+    await Promise.all(
+        Array.from(
+            { length: Math.min(concurrency, stopIds.length) },
+            () => worker()
+        )
+    );
+
+    const valid = [];
+
+    for (const c of candidates) {
+        let elapsed = routeWalkingMinutes(c.walkStart);
+        let feasible = true;
+        let firstWait = null;
+        let firstDepartureClock = null;
+        let liveConfirmed = true;
+
+        for (let i = 0; i < c.segments.length; i++) {
+            const seg = c.segments[i];
+            const data = cache.get(String(seg.boardStop));
+
+            let arrivals = (data?.estimaciones || [])
+                .filter(x => normalizeLine(x.linea) === normalizeLine(seg.line))
+                .filter(x => Number.isFinite(x.minutos));
+
+            if (!arrivals.length) {
+                // El primer tramo SIEMPRE debe tener una salida real.
+                if (i === 0) {
+                    feasible = false;
+                    break;
+                }
+
+                // Para transbordos, intentamos validar igualmente con PMV.
+                // Si no hay dato, no presentamos ese tramo como "en tiempo real".
+                liveConfirmed = false;
+                seg.live = null;
+                seg.waitMin = 0;
+                seg.liveDestination = seg.terminal;
+                elapsed += seg.rideMin;
+
+                if (i < c.segments.length - 1) {
+                    elapsed += routeWalkingMinutes((c.transferWalks || [])[i] || 0);
+                }
+                continue;
+            }
+
+            const matching = arrivals.filter(
+                x => routeMatchLiveDirection(x, seg.terminal)
+            );
+
+            if (matching.length) arrivals = matching;
+
+            const possible = arrivals
+                .filter(x => x.minutos + 0.25 >= elapsed)
+                .sort((a, b) => a.minutos - b.minutos);
+
+            const best = possible[0];
+
+            if (!best) {
+                if (i === 0) {
+                    feasible = false;
+                    break;
+                }
+
+                liveConfirmed = false;
+                seg.live = null;
+                seg.waitMin = 0;
+                seg.liveDestination = seg.terminal;
+            } else {
+                const wait = Math.max(0, best.minutos - elapsed);
+
+                if (i === 0) {
+                    firstWait = best.minutos;
+                    firstDepartureClock = wait;
+                }
+
+                seg.live = best;
+                seg.waitMin = wait;
+                seg.liveDestination = best.destino || seg.terminal;
+                seg.liveStatus = best.minutos <= 1
+                    ? "ahora"
+                    : `en ${Math.round(best.minutos)} min`;
+
+                elapsed += wait;
+            }
+
+            elapsed += seg.rideMin;
+
+            if (i < c.segments.length - 1) {
+                elapsed += routeWalkingMinutes(
+                    (c.transferWalks || [])[i] || 0
+                );
+            }
+        }
+
+        if (!feasible) continue;
+
+        elapsed += routeWalkingMinutes(c.walkEnd);
+
+        c.firstDepartureMin = firstWait;
+        c.firstDepartureClock = firstDepartureClock;
+        c.liveConfirmed = liveConfirmed;
+        c.totalMin = Math.max(1, Math.ceil(elapsed));
+        c.liveDirectionMismatch = false;
+        c.liveCheckedAt = new Date().toISOString();
+
+        valid.push(c);
+    }
+
+    return valid;
+}
+
+
+/* ===== V10.3 · BÚSQUEDA ===== */
+const _searchRoutesV10 = searchRoutes;
+searchRoutes = async function() {
+    // Usamos el cargador completo antes de resolver incluso una parada
+    // numérica del CSV.
+    try {
+        await routeLoadCsvWithCompleteStops();
+    } catch (e) {
+        const status = $("routeGeocodeStatus");
+        status.hidden = false;
+        status.textContent = e.message || "No se ha podido cargar el directorio EMT.";
+        return;
+    }
+
+    return _searchRoutesV10();
+};
+
+// Para que la función anterior no vuelva a usar el cargador antiguo y para
+// admitir destinos exactos del CSV, interceptamos routeResolveEndpoint.
+const _routeResolveEndpointV10 = routeResolveEndpoint;
+routeResolveEndpoint = function(input, isOrigin = false) {
+    const raw = String(input || "").trim();
+    const numericStop = raw.match(/^(?:parada\s*)?(\d{1,5})$/i);
+
+    if (numericStop) {
+        const stop = routeStopInfo(numericStop[1]);
+        if (stop && Number.isFinite(stop.lat) && Number.isFinite(stop.lon)) {
+            return Promise.resolve({
+                lat: stop.lat,
+                lon: stop.lon,
+                label: `Parada ${stop.parada} · ${stop.nombre || "Parada EMT"}`,
+                stop
+            });
+        }
+    }
+
+    return _routeResolveEndpointV10(input, isOrigin);
+};
+
+window.EMT_ROUTE_V103 = {
+    version: "10.3",
+    completeCsvStopIndex: true,
+    utmProjection: "ETRS89 / UTM zona 30"
+};
+</script>
 
 </body>
 </html>
