@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EMT Madrid · V11.1</title>
+<title>EMT Madrid · V11.2</title>
 
 <style>
 :root {
@@ -1122,7 +1122,7 @@ if (GOATCOUNTER_CODE) {
             <input type="checkbox" id="routeOnlyLive">
             <span>Mostrar solo itinerarios con la primera salida confirmada por EMT</span>
         </label>
-        <p class="route-note">V11.1: el itinerario se calcula sobre toda la red EMT (algoritmo RAPTOR, hasta 5 transbordos) y PMVVisor solo <strong>ajusta</strong> la espera del primer tramo &mdash; ya no descarta rutas. Cuando una direcci&oacute;n existe en varios puntos de Madrid (por ejemplo <em>Calle del Aire</em>), la app <strong>pregunta</strong> en vez de elegir por ti. Acepta direcciones, nombres y n&uacute;meros de parada y coordenadas <code>40.41,-3.70</code>.</p>
+        <p class="route-note">V11.2: las direcciones se resuelven con <strong>CartoCiudad</strong> (el geocodificador oficial del IGN), m&aacute;s Photon y Nominatim. Si una direcci&oacute;n existe en varios puntos de Madrid, la app <strong>pregunta</strong>; y junto al origen y al destino resueltos tienes siempre un bot&oacute;n <em>cambiar</em> para corregirlo. El itinerario se calcula con RAPTOR sobre toda la red EMT. Acepta direcciones, nombres y n&uacute;meros de parada y coordenadas <code>40.41,-3.70</code>.</p>
         <div class="route-geocode-status" id="routeGeocodeStatus" hidden></div>
     </section>
 
@@ -2222,7 +2222,8 @@ const routeState = {
     routeToken: 0,
     lastDiagnostics: null,
     pinned: { origin: null, destination: null },
-    pendingChoice: null
+    pendingChoice: null,
+    lastCandidates: { origin: [], destination: [] }
 };
 
 /* --- Parametros del modelo ------------------------------------------- */
@@ -2239,7 +2240,7 @@ const ROUTE_TRANSFER_PENALTY = 3;     // min de penalizacion por transbordo
 const ROUTE_MIN_TRANSFER_MIN = 1;     // margen minimo al cambiar de linea
 
 const ROUTE_GEO_TTL_MS = 30 * 24 * 3600 * 1000;
-const ROUTE_GEO_STORE  = 'emt_geocode_v11';
+const ROUTE_GEO_STORE  = 'emt_geocode_v11_2';   // V11.0/V11.1 guardaron resultados erroneos: namespace nuevo
 // Caja de Madrid capital + area EMT (lon_min, lat_min, lon_max, lat_max)
 const ROUTE_MADRID_BBOX = { minLon: -3.95, minLat: 40.28, maxLon: -3.50, maxLat: 40.58 };
 
@@ -2901,9 +2902,69 @@ function routeGeoStoreSave(key, value) {
     } catch { /* cuota llena o modo privado: no es critico */ }
 }
 
+function routeForget(text) {
+    try {
+        const key = routeNormalize(text);
+        routeState.geocodeCache.delete(key);
+        const store = routeGeoStoreLoad();
+        delete store[key];
+        localStorage.setItem(ROUTE_GEO_STORE, JSON.stringify(store));
+    } catch { /* nada critico */ }
+}
+
 function routeInMadrid(lat, lon) {
     return lat >= ROUTE_MADRID_BBOX.minLat && lat <= ROUTE_MADRID_BBOX.maxLat
         && lon >= ROUTE_MADRID_BBOX.minLon && lon <= ROUTE_MADRID_BBOX.maxLon;
+}
+
+/*
+ * JSONP: CartoCiudad (IGN) no envia cabeceras CORS, pero si admite
+ * callback JSONP, asi que se puede usar desde una pagina estatica.
+ */
+function routeJsonp(url, { timeout = 8000 } = {}) {
+    return new Promise((resolve, reject) => {
+        const cb = `emtGeo${Date.now()}${Math.floor(Math.random() * 1e6)}`;
+        const script = document.createElement('script');
+        let done = false;
+        const cleanup = () => {
+            if (done) return; done = true;
+            delete window[cb];
+            if (script.parentNode) script.parentNode.removeChild(script);
+        };
+        const timer = setTimeout(() => { cleanup(); reject(new Error('tiempo agotado')); }, timeout);
+        window[cb] = data => { clearTimeout(timer); cleanup(); resolve(data); };
+        script.onerror = () => { clearTimeout(timer); cleanup(); reject(new Error('no accesible')); };
+        script.src = url + (url.includes('?') ? '&' : '?') + 'callback=' + cb;
+        document.head.appendChild(script);
+    });
+}
+
+/*
+ * CartoCiudad es el geocodificador OFICIAL de direcciones de España
+ * (IGN + Catastro + INE). Para un portal concreto de Madrid es bastante
+ * mas fiable que OpenStreetMap, que es donde V11.0 se equivocaba de calle.
+ */
+async function routeCartoCiudad(want) {
+    const q = want.numero ? `${want.via}, ${want.numero}, Madrid` : `${want.via}, Madrid`;
+    const url = `https://www.cartociudad.es/geocoder/api/geocoder/candidatesJsonp?q=${encodeURIComponent(q)}&limit=12&no_process=municipio,poblacion,toponimo&countryCode=011`;
+    const data = await routeJsonp(url);
+    const list = Array.isArray(data) ? data : (data?.candidates || data?.results || []);
+    return list.map(c => {
+        const lat = Number(c.lat ?? c.latitud ?? c.y);
+        const lon = Number(c.lng ?? c.lon ?? c.longitud ?? c.x);
+        return {
+            lat, lon, source: 'cartociudad',
+            type: c.type, category: 'address',
+            importance: 0.2,
+            portalExacto: want.numero ? String(c.portalNumber ?? '') === String(want.numero) : false,
+            name: c.address,
+            address: {
+                road: c.address, house_number: c.portalNumber != null ? String(c.portalNumber) : undefined,
+                suburb: c.poblacion || c.tip_via, city: c.muni, postcode: c.postalCode
+            },
+            display_name: [c.address, c.portalNumber, c.poblacion, c.muni, c.postalCode].filter(Boolean).join(', ')
+        };
+    }).filter(c => Number.isFinite(c.lat) && Number.isFinite(c.lon));
 }
 
 let routeGeoLastCall = 0;
@@ -2927,7 +2988,10 @@ function routeCandidateShort(item) {
     const num = a.house_number ? `, ${a.house_number}` : '';
     const zona = a.suburb || a.quarter || a.city_district || a.district || '';
     const muni = a.city || a.town || a.village || a.municipality || '';
-    const partes = [`${via}${num}`.trim(), zona, muni].filter((v, i, arr) => v && arr.indexOf(v) === i);
+    const cp = a.postcode ? `CP ${a.postcode}` : '';
+    // El codigo postal es lo unico que distingue dos portales homonimos
+    // dentro del mismo municipio, asi que nunca lo omitimos.
+    const partes = [`${via}${num}`.trim(), zona, muni, cp].filter((v, i, arr) => v && arr.indexOf(v) === i);
     return partes.join(' · ') || item.display_name || 'Resultado';
 }
 
@@ -2945,6 +3009,8 @@ function routeScoreCandidate(c, want) {
     if (c.category === 'highway') score += 0.4;
     if (want.via && routeNormalize(a.road || '').startsWith(routeNormalize(want.via).replace(/^(CALLE|AVENIDA|PASEO|PLAZA|RONDA|CAMINO|GLORIETA)\s+/, ''))) score += 1;
     score += Math.min(1.5, Number(c.importance || 0) * 3);
+    if (c.source === 'cartociudad') score += 1.5;      // fuente oficial española
+    if (c.portalExacto) score += 2;
     if (c.source === 'photon') score -= 0.3;
     return score;
 }
@@ -3035,6 +3101,9 @@ async function routeGeocodeCandidates(raw, { quick = false } = {}) {
         }
     };
 
+    try { collect(await routeCartoCiudad(want)); }
+    catch (e) { errors.push(`CartoCiudad: ${e.message}`); }
+
     try { collect(await routePhoton(want.numero ? `${want.via} ${want.numero}, Madrid` : `${want.via}, Madrid`)); }
     catch (e) { errors.push(`Photon: ${e.message}`); }
 
@@ -3066,8 +3135,10 @@ function routeIsAmbiguous(cands) {
     if (cands.length < 2) return false;
     const [a, b] = cands;
     if (a.source === 'parada' && a.score >= 9) return false;
-    const far = distanceKm(a.lat, a.lon, b.lat, b.lon) > 0.6;
-    return far && (a.score - b.score) < 2.5;
+    // Preferimos preguntar de mas que acertar de menos: basta con que el
+    // segundo candidato este en otra zona y no sea claramente peor.
+    const far = distanceKm(a.lat, a.lon, b.lat, b.lon) > 0.35;
+    return far && (a.score - b.score) < 4;
 }
 
 class RouteAmbiguity extends Error {
@@ -3114,7 +3185,8 @@ async function routeGeocode(input, field = 'destination') {
             + ' Prueba con «calle, número, distrito», con un número de parada, o con coordenadas «40.41,-3.70».');
     }
 
-    if (routeIsAmbiguous(cands)) throw new RouteAmbiguity(field, raw, cands.slice(0, 6));
+    routeState.lastCandidates[field] = cands.slice(0, 8);
+    if (routeIsAmbiguous(cands)) throw new RouteAmbiguity(field, raw, cands.slice(0, 8));
 
     const best = cands[0];
     routeState.geocodeCache.set(key, best);
@@ -3277,9 +3349,15 @@ function routeDiagnosticsHtml(d) {
         ['PMVVisor', d.pmv ? `${d.pmv.correctas}/${d.pmv.consultadas} paradas con datos` : 'no consultado'],
         ['Tiempo de cálculo', `${d.ms} ms`]
     ];
+    const candBlock = ['origin', 'destination'].map(f => {
+        const list = routeState.lastCandidates[f] || [];
+        if (!list.length) return '';
+        const rows = list.map(c => `<li><code>${c.lat.toFixed(5)}, ${c.lon.toFixed(5)}</code> · ${escapeHtml(c.short || c.label)} <em>[${escapeHtml(c.source)} · ${Number(c.score || 0).toFixed(1)}]</em></li>`).join('');
+        return `<div class="route-cands"><strong>Candidatos de ${f === 'origin' ? 'origen' : 'destino'}</strong><ol>${rows}</ol></div>`;
+    }).join('');
     return `<details class="route-diagnostics"><summary>Diagnóstico de la búsqueda</summary><dl>`
         + rows.map(([k, v]) => `<div><dt>${escapeHtml(k)}</dt><dd>${v}</dd></div>`).join('')
-        + `</dl></details>`;
+        + `</dl>${candBlock}</details>`;
 }
 
 /* ===== Orquestacion =================================================== */
@@ -3334,13 +3412,19 @@ async function searchRoutes() {
         status.querySelectorAll('.route-repick').forEach(b => b.addEventListener('click', async () => {
             const field = b.dataset.field;
             const text = $(field === 'origin' ? 'routeOrigin' : 'routeDestination').value.trim();
-            routeState.pinned[field] = null;
-            routeState.geocodeCache.delete(routeNormalize(text));
-            const cands = await routeGeocodeCandidates(text);
-            if (cands.length < 2) { status.textContent = 'No hay otras coincidencias para ese texto.'; return; }
-            const err = new RouteAmbiguity(field, text, cands.slice(0, 6));
             routeState.routeToken++;
             const tk = routeState.routeToken;
+            routeState.pinned[field] = null;
+            routeState.geocodeCache.delete(routeNormalize(text));
+            routeForget(text);
+            results.innerHTML = '<div class="route-loading">Buscando todas las direcciones que encajan…</div>';
+            let cands = routeState.lastCandidates[field] || [];
+            if (cands.length < 2) {
+                try { cands = await routeGeocodeCandidates(text); } catch { cands = []; }
+            }
+            if (tk !== routeState.routeToken) return;
+            if (!cands.length) { results.innerHTML = '<div class="route-empty">No hay otras coincidencias para ese texto.</div>'; return; }
+            const err = new RouteAmbiguity(field, text, cands.slice(0, 8));
             results.innerHTML = routeChoiceHtml(err);
             results.querySelectorAll('[data-choice]').forEach(btn => btn.addEventListener('click', () => {
                 if (tk !== routeState.routeToken) return;
@@ -3519,6 +3603,8 @@ $('routeClearBtn').addEventListener('click', () => {
     $('routeResults').innerHTML = ''; $('routeResultsCard').hidden = true;
     $('routeGeocodeStatus').hidden = true;
     routeState.pinned = { origin: null, destination: null };
+    routeState.lastCandidates = { origin: [], destination: [] };
+    try { localStorage.removeItem(ROUTE_GEO_STORE); } catch {}
     ['routeOriginSuggest', 'routeDestinationSuggest'].forEach(id => { const el = document.getElementById(id); if (el) el.innerHTML = ''; });
 });
 ['routeOrigin', 'routeDestination'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key === 'Enter') searchRoutes(); }));
@@ -3640,6 +3726,13 @@ setTimeout(() => { routeLoadCsv().catch(() => {}); }, 1200);
 .route-diagnostics em { color:var(--muted); font-style:normal; font-size:10px; }
 @media (max-width:760px) { .route-diagnostics dl > div { grid-template-columns:1fr; gap:1px; } }
 .route-empty p { margin:8px 0 0; font-size:12px; color:var(--muted); font-weight:500; }
+
+.route-cands { margin-top:12px; padding-top:10px; border-top:1px dashed var(--border); }
+.route-cands strong { display:block; color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.06em; }
+.route-cands ol { margin:7px 0 0; padding-left:20px; display:grid; gap:4px; }
+.route-cands li { font-size:11px; }
+.route-cands code { font-size:10px; color:var(--accent); }
+.route-cands em { font-style:normal; color:var(--muted); font-size:10px; }
 
 /* ===== V10 · RUTAS EN TIEMPO REAL ===== */
 .route-controls { display:none !important; }
